@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# One-screen box + session status for low-bandwidth checks over mosh.
+set -uo pipefail
+
+ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+SESSION="${CLANKER_TMUX_SESSION:-work}"
+
+echo "== $(hostname) $(date '+%F %T') up$(uptime -p | sed 's/up//')"
+echo "== load: $(cut -d' ' -f1-3 /proc/loadavg)   mem: $(free -h | awk '/^Mem/{print $3"/"$2}')   disk: $(df -h / | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+
+echo "== failed units:"
+systemctl --failed --no-legend --plain 2>/dev/null | sed 's/^/   /' || true
+systemctl --user --failed --no-legend --plain 2>/dev/null | sed 's/^/   /' || true
+
+echo "== dispatch listener: $(systemctl --user is-active ntfy-dispatch 2>/dev/null || echo unknown)"
+
+echo "== tmux windows ($SESSION):"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux list-windows -t "$SESSION" -F '   #W  (#{window_activity_flag}act #{pane_current_command})'
+else
+  echo "   (no session)"
+fi
+
+echo "== last dispatch log lines:"
+journalctl --user -u ntfy-dispatch -n 5 --no-pager -o cat 2>/dev/null | sed 's/^/   /' || echo "   (no journal)"

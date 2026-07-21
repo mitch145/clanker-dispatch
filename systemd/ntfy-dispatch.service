@@ -1,0 +1,21 @@
+[Unit]
+Description=ntfy dispatch listener (clanker-dispatch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/clanker/env
+ExecStart=%h/.local/bin/dispatch-listener
+Restart=always
+RestartSec=10
+
+# NO MemoryMax / Nice here. A tmux server created by spawn would inherit this
+# cgroup, putting every Claude session it holds under a cap meant to bound a
+# bash+curl loop — they get OOM-killed under load, and a cgroup-local kill
+# leaves no dmesg line while the box shows gigabytes free. spawn also starts
+# the server via `systemd-run --user --scope` to escape this cgroup; belt and
+# braces, because the failure mode is silent and looks like a crash.
+# The listener itself is curl+jq+bash and needs no cap.
+
+[Install]
+WantedBy=default.target

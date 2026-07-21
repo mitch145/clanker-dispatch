@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Subscribes to the ntfy topic and spawns Claude Code sessions from
+# messages of the form: <review|implement|continue> <ticket> [extra...]
+# All other messages (including this script's own confirmations) are ignored.
+set -euo pipefail
+
+ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+
+: "${NTFY_TOKEN:?set NTFY_TOKEN in $ENV_FILE}"
+: "${NTFY_TOPIC_URL:?set NTFY_TOPIC_URL in $ENV_FILE}"
+
+# Without jq the message filter below evaluates false for every line and the
+# listener silently ignores all dispatches. Fail loudly instead.
+command -v jq >/dev/null || { echo "missing dependency: jq" >&2; exit 1; }
+
+SPAWN="$(dirname "$(readlink -f "$0")")/spawn"
+
+# Our own publishes carry this tag so the loop below can skip them. Commands
+# and confirmations share one topic; without this a confirmation whose body
+# happens to parse as a dispatch would re-trigger a spawn, forever.
+ACK_TAG=clanker-ack
+
+notify() { # notify <title> <body> [priority]
+  curl -s --max-time 10 \
+    -H "Authorization: Bearer $NTFY_TOKEN" \
+    -H "Title: $1" -H "Tags: $ACK_TAG" ${3:+-H "Priority: $3"} \
+    -d "$2" "$NTFY_TOPIC_URL" >/dev/null || true
+}
+
+echo "listening on $NTFY_TOPIC_URL"
+while true; do
+  curl -sN --max-time 0 \
+    -H "Authorization: Bearer $NTFY_TOKEN" \
+    "$NTFY_TOPIC_URL/json?since=10m" | \
+  while read -r line; do
+    [[ "$(jq -r '.event // empty' <<< "$line")" == "message" ]] || continue
+    msg="$(jq -r '.message // empty' <<< "$line")"
+    [[ -n "$msg" ]] || continue
+
+    # Never act on our own confirmations (see ACK_TAG above)
+    tags=" $(jq -r '(.tags // []) | join(" ")' <<< "$line") "
+    [[ "$tags" == *" $ACK_TAG "* ]] && continue
+
+    # iOS Shortcuts' "Get Contents of URL" defaults to a JSON body, so a phone
+    # dispatch arrives as the literal text {"implement":"9999"} rather than
+    # `implement 9999`. Accept both shapes instead of fighting the default:
+    #   {"implement":"9999"}          -> implement 9999
+    #   {"message":"implement 9999"}  -> implement 9999
+    if [[ "$msg" == \{* ]] && jq -e . >/dev/null 2>&1 <<< "$msg"; then
+      msg="$(jq -r 'if has("message") then (.message | tostring)
+                    elif (to_entries | length) > 0
+                      then (to_entries[0] | "\(.key) \(.value)")
+                    else empty end' <<< "$msg")"
+      [[ -n "$msg" ]] || { echo "ignored (empty JSON body)"; continue; }
+    fi
+
+    read -r cmd ticket rest <<< "$msg" || true
+    # Non-dispatch traffic is ignored, but say so in the journal — otherwise a
+    # typo'd verb looks exactly like a dead listener from the phone's side.
+    # Verb list mirrors bin/spawn; `status` is the one verb that takes no id.
+    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|new|session)$ ]]; then
+      echo "ignored (not a dispatch): $msg"
+      continue
+    fi
+    if ! [[ "$cmd" =~ ^(status|new|session)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
+      echo "ignored (bad id): $msg"
+      continue
+    fi
+
+    echo "dispatch: $cmd ${ticket:-} ${rest:-}"
+    # Bodies deliberately lead with a non-verb word: belt-and-braces with
+    # ACK_TAG, so a stripped tag still can't make a confirmation re-dispatch.
+    #
+    # Exit 3 means spawn hit its idempotency guard. That is not a failure, but
+    # it must not report "started" either — on a redelivery you'd get a push
+    # saying a session began when nothing did.
+    rc=0; "$SPAWN" "$cmd" ${ticket:+"$ticket"} ${rest:-} || rc=$?
+    case "$rc" in
+      0) notify "Spawned"      "started $cmd ${ticket:-}" ;;
+      3) notify "Already up"   "existing session for $cmd ${ticket:-}" ;;
+      *) notify "Spawn FAILED" "failed $cmd ${ticket:-} (exit $rc)" high ;;
+    esac
+  done
+  echo "stream closed; reconnecting in 5s"
+  sleep 5
+done

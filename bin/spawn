@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# spawn <verb> [id] [extra context...]
+#
+# Creates a tmux window running a /sl-* slash command as a detached Claude Code
+# session, so it self-registers in the Claude app (needs Remote Control enabled
+# for all sessions). Invoked by dispatch-listener, or by hand over ssh/mosh.
+# Nothing here depends on an interactive shell rc.
+#
+#   spawn implement 1234
+#   spawn implement 1234 stack on the parent PR
+#   spawn review 3771
+#   spawn status
+#
+# Config comes from ~/.config/clanker/env (CLANKER_ENV to override):
+#   CLANKER_REPO, CLANKER_TMUX_SESSION, CLANKER_GH_REPO, CLAUDE_BIN
+set -euo pipefail
+
+ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+
+REPO="${CLANKER_REPO:?set CLANKER_REPO in $ENV_FILE}"
+SESSION="${CLANKER_TMUX_SESSION:-work}"
+GH_REPO="${CLANKER_GH_REPO:-slate-technologies/slate}"
+
+EX_SKIP=3   # window already exists — a no-op, not a failure
+
+usage() {
+  cat >&2 <<'EOF'
+usage: spawn <verb> [id] [extra context...]
+
+  implement|ship 1234   -> /sl-ship SLATE-1234       (keyed by ticket)
+  plan           1234   -> /sl-plan SLATE-1234
+  style          1234   -> /sl-style SLATE-1234
+  cleanup        1234   -> /sl-cleanup SLATE-1234
+  review         3771   -> /sl-review <pr url>       (keyed by PR number)
+  continue|revise 3771  -> /sl-revise 3771
+  status                -> /sl-status                (no id)
+  new|session [text...]  -> bare claude session in the repo
+EOF
+  exit 64
+}
+
+[[ $# -ge 1 ]] || usage
+verb="$1"; shift
+
+# Whitelisted verbs only — this is remote code execution by design, so the arg
+# surface stays closed: known verb + numeric id + free-text tail. Each verb
+# answers to both the intent word and its command's own name, so you never have
+# to recall which vocabulary this wants.
+#
+# idstyle matters: ticket verbs are keyed by SLATE-N, review/revise by PR
+# number. Those are different id spaces and must not share validation.
+case "$verb" in
+  implement|ship)  act=ship;    slash="/sl-ship";    idstyle=ticket ;;
+  plan)            act=plan;    slash="/sl-plan";    idstyle=ticket ;;
+  style)           act=style;   slash="/sl-style";   idstyle=ticket ;;
+  cleanup)         act=cleanup; slash="/sl-cleanup"; idstyle=ticket ;;
+  review)          act=review;  slash="/sl-review";  idstyle=prurl  ;;  # full URL
+  continue|revise) act=revise;  slash="/sl-revise";  idstyle=pr     ;;
+  status)          act=status;  slash="/sl-status";  idstyle=none   ;;
+  # Bare session in the repo, no slash command. Any trailing text becomes the
+  # opening prompt: `new look at the flaky auth test`.
+  new|session)     act=new;     slash="";            idstyle=none   ;;
+  *) echo "spawn: unknown verb '$verb'" >&2; usage ;;
+esac
+
+# `new` is the one verb you'd deliberately run twice — it's a blank session, not
+# a claim on a work item — so it suffixes instead of hitting the guard below.
+dedupe=skip
+[[ "$act" == new ]] && dedupe=suffix
+
+# Window name is <action>-<number>, e.g. ship-1234, review-3771. Keyed on the
+# action too, not the id alone: review and revise share the PR id space, and
+# reviewing a PR then revising it is an ordinary sequence that must not trip
+# the idempotency guard. It doubles as the session name in the Claude app, so
+# it has to say what the session is doing, not just which number it concerns.
+if [[ "$idstyle" == none ]]; then
+  id=""; label="$act"
+else
+  [[ $# -ge 1 ]] || usage
+  raw="${1#SLATE-}"; raw="${raw#slate-}"; raw="${raw#\#}"
+  shift
+  [[ "$raw" =~ ^[0-9]{1,6}$ ]] || { echo "spawn: bad id '$raw' (digits only)" >&2; exit 64; }
+  label="$act-$raw"
+  case "$idstyle" in
+    ticket) id="SLATE-$raw" ;;
+    prurl)  id="https://github.com/$GH_REPO/pull/$raw" ;;
+    pr)     id="$raw" ;;
+  esac
+fi
+
+extra="$*"
+if [[ -n "$slash" ]]; then
+  prompt="$slash${id:+ $id}${extra:+ — $extra}"
+else
+  prompt="$extra"   # bare session: the tail IS the prompt, and may be empty
+fi
+
+[[ -d "$REPO" ]] || { echo "spawn: repo not found: $REPO" >&2; exit 66; }
+
+# Resolve claude by absolute path, never by PATH alone. The systemd user unit
+# runs with a PATH that has no ~/.local/bin, so a bare `claude` fails there —
+# intermittently, because a window inherits the env of whichever process
+# created the tmux server, so it works iff an interactive shell got there first.
+claude_bin="${CLAUDE_BIN:-}"
+if [[ -z "$claude_bin" ]]; then
+  for cand in "$HOME/.local/bin/claude" "$(command -v claude || true)"; do
+    [[ -n "$cand" && -x "$cand" ]] && { claude_bin="$cand"; break; }
+  done
+fi
+[[ -n "$claude_bin" && -x "$claude_bin" ]] \
+  || { echo "spawn: claude not found (set CLAUDE_BIN in $ENV_FILE)" >&2; exit 127; }
+
+# Create the tmux server OUTSIDE this process's cgroup when we're the one
+# creating it. Called from the systemd unit, a server started here would inherit
+# the service's resource limits, and every Claude session it holds would then
+# live under a cap meant only to bound the listener.
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  if command -v systemd-run >/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}${XDG_RUNTIME_DIR:-}" ]]; then
+    systemd-run --user --scope --quiet --unit="clanker-tmux-$SESSION" \
+      tmux new-session -d -s "$SESSION" 2>/dev/null \
+      || tmux new-session -d -s "$SESSION"
+  else
+    tmux new-session -d -s "$SESSION"
+  fi
+fi
+
+# Idempotency guard: one window per id. ntfy delivers at least once, and the
+# listener replays `since=10m` on restart, so a redelivered message must not
+# spawn a second session. Deliberately a hard skip, not a -2 suffix: the
+# listener is the reason this exists, and silent double-spawn is the worse bug.
+if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label"; then
+  if [[ "$dedupe" == skip ]]; then
+    echo "window $label already exists; skipping" >&2
+    exit "$EX_SKIP"
+  fi
+  # Suffix is -N, never .N: a dot collides with tmux's session:window.pane syntax.
+  n=2
+  while tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label-$n"; do
+    n=$((n + 1))
+  done
+  label="$label-$n"
+fi
+
+# Name the session twice over, both matching the tmux window:
+#   -n               sets `name` in ~/.claude/sessions/<pid>.json
+#   --remote-control sets the app-side name
+# Without these it registers under a derived name (slate-a8, slate-e7) and every
+# concurrent session looks identical in the app — indistinguishable from "it
+# never showed up". Use the `=` form: --remote-control's value is optional, so a
+# space-separated name risks the parser swallowing the prompt arg.
+#
+# printf %q on every interpolation — the free-text tail is user input and an
+# apostrophe ("don't rebase") would otherwise break out of the quoting.
+# -d so an attached client doesn't lose focus; `exec $SHELL` so the window
+# survives claude exiting and the scrollback is there for a post-mortem.
+cmdline="cd $(printf %q "$REPO") && $(printf %q "$claude_bin")"
+cmdline+=" -n $(printf %q "$label") --remote-control=$(printf %q "$label")"
+# Omit the prompt arg entirely when empty — an empty string is still an
+# argument, and `claude ''` is not the same as `claude`.
+[[ -n "$prompt" ]] && cmdline+=" $(printf %q "$prompt")"
+cmdline+="; exec ${SHELL:-/bin/bash}"
+
+tmux new-window -d -t "$SESSION" -n "$label" "$cmdline"
+
+echo "spawned [$SESSION:$label] ${prompt:-(bare session)}"
