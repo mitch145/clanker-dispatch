@@ -138,16 +138,28 @@ fi
 # spawn a second session. Deliberately a hard skip, not a -2 suffix: the
 # listener is the reason this exists, and silent double-spawn is the worse bug.
 if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label"; then
+  # Only a *live* session blocks a re-dispatch. Windows outlive claude on
+  # purpose (scrollback for a post-mortem), so testing mere existence would
+  # refuse to re-run finished work until the sweeper got round to it — and
+  # report "Already up" about a session that ended half an hour ago.
   if [[ "$dedupe" == skip ]]; then
-    echo "window $label already exists; skipping" >&2
-    exit "$EX_SKIP"
+    if pgrep -f -- "--remote-control=$label( |\$)" >/dev/null 2>&1; then
+      echo "window $label already exists; skipping" >&2
+      exit "$EX_SKIP"
+    fi
+    # Reaped, so the name is free again — reuse it rather than falling through
+    # to the suffix branch, which would leave you with ship-1234-2 for what is
+    # simply the current session for that ticket.
+    echo "reaping finished window $label" >&2
+    tmux kill-window -t "$SESSION:$label" 2>/dev/null || true
+  else
+    # Suffix is -N, never .N: a dot collides with tmux's session:window.pane syntax.
+    n=2
+    while tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label-$n"; do
+      n=$((n + 1))
+    done
+    label="$label-$n"
   fi
-  # Suffix is -N, never .N: a dot collides with tmux's session:window.pane syntax.
-  n=2
-  while tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label-$n"; do
-    n=$((n + 1))
-  done
-  label="$label-$n"
 fi
 
 # Name the session twice over, both matching the tmux window:

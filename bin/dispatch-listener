@@ -40,6 +40,19 @@ mkdir -p "$STATE_DIR"
 SEEN="$STATE_DIR/seen-ids"
 touch "$SEEN"
 
+CURSOR="$STATE_DIR/last-seen-ts"
+
+# Resume from the last message actually seen, not a fixed 10-minute window.
+# The box sleeps (laptop lid, Windows suspend, reboot) and anything dispatched
+# while it was down used to fall off the end of a 10m replay and vanish with no
+# error anywhere. Safe only because of the id dedupe below — without that, a
+# wide replay window double-spawns everything.
+since_param() {
+  local ts
+  ts="$(cat "$CURSOR" 2>/dev/null)"
+  if [[ "$ts" =~ ^[0-9]+$ ]]; then echo "$((ts - 30))"; else echo "10m"; fi
+}
+
 seen() { grep -qxF "$1" "$SEEN" 2>/dev/null; }
 remember() {
   echo "$1" >> "$SEEN"
@@ -52,11 +65,16 @@ echo "listening on $NTFY_TOPIC_URL"
 while true; do
   curl -sN --max-time 0 \
     -H "Authorization: Bearer $NTFY_TOKEN" \
-    "$NTFY_TOPIC_URL/json?since=10m" | \
+    "$NTFY_TOPIC_URL/json?since=$(since_param)" | \
   while read -r line; do
     [[ "$(jq -r '.event // empty' <<< "$line")" == "message" ]] || continue
     msg="$(jq -r '.message // empty' <<< "$line")"
     [[ -n "$msg" ]] || continue
+
+    # Advance the cursor for every message, acted on or not — the point is
+    # "where did the stream get to", not "what did we do".
+    mtime="$(jq -r '.time // empty' <<< "$line")"
+    [[ "$mtime" =~ ^[0-9]+$ ]] && echo "$mtime" > "$CURSOR"
 
     mid="$(jq -r '.id // empty' <<< "$line")"
     if [[ -n "$mid" ]]; then
