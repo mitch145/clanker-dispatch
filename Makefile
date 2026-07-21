@@ -8,11 +8,6 @@ ENV   := $(HOME)/.config/clanker/env
 .PHONY: help install start stop restart status logs sitrep doctor dispatch topic \
         sessions sweep kill worktrees
 
-# A window's pane_current_command is the wrapper shell, not claude, so liveness
-# has to come from the process table. Anchor on ( |$) — plain `=new` is a prefix
-# of `=new-2` and would report a dead window as live.
-LIVE = pgrep -f -- "--remote-control=$$w( |$$)" >/dev/null 2>&1
-
 help: ## Show this menu
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) \
 	  | sed 's/:.*## /\t/' | awk -F'\t' '{printf "  %-9s %s\n", $$1, $$2}'
@@ -52,28 +47,12 @@ dispatch: ## make dispatch VERB=implement TICKET=1234  (TICKET optional: new, st
 	  && echo "published: $$body"
 
 sessions: ## List spawned windows and whether each still has a live claude
-	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
-	tmux has-session -t $$s 2>/dev/null || { echo "  (no tmux session)"; exit 0; }; \
-	for w in $$(tmux list-windows -t $$s -F '#W'); do \
-	  if $(LIVE); then st="LIVE"; else st="finished"; fi; \
-	  printf "  %-18s %s\n" "$$w" "$$st"; \
-	done
+	@./bin/sessions list
 
 # Windows outlive claude on purpose (`exec $$SHELL`) so the scrollback survives
 # for a post-mortem — which means they accumulate until something reaps them.
 sweep: ## Kill finished windows, leave live sessions running
-	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
-	tmux has-session -t $$s 2>/dev/null || { echo "  (no tmux session)"; exit 0; }; \
-	n=0; \
-	for w in $$(tmux list-windows -t $$s -F '#W'); do \
-	  case "$$w" in \
-	    ship-*|plan-*|style-*|cleanup-*|review-*|revise-*|status|new|new-*) ;; \
-	    *) continue ;; \
-	  esac; \
-	  if $(LIVE); then echo "  keep  $$w (live)"; \
-	  else tmux kill-window -t "$$s:$$w" && echo "  swept $$w"; n=$$((n+1)); fi; \
-	done; \
-	echo "  swept $$n window(s)"
+	@./bin/sessions sweep
 
 kill: ## make kill W=ship-1234 — kill one window, live or not
 	@[[ -n "$(W)" ]] || { echo "usage: make kill W=ship-1234" >&2; exit 2; }

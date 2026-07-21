@@ -15,7 +15,9 @@ ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
 # listener silently ignores all dispatches. Fail loudly instead.
 command -v jq >/dev/null || { echo "missing dependency: jq" >&2; exit 1; }
 
-SPAWN="$(dirname "$(readlink -f "$0")")/spawn"
+BINDIR="$(dirname "$(readlink -f "$0")")"
+SPAWN="$BINDIR/spawn"
+SESSIONS="$BINDIR/sessions"
 
 # Our own publishes carry this tag so the loop below can skip them. Commands
 # and confirmations share one topic; without this a confirmation whose body
@@ -29,6 +31,23 @@ notify() { # notify <title> <body> [priority]
     -d "$2" "$NTFY_TOPIC_URL" >/dev/null || true
 }
 
+# The stream is replayed with since=10m on every reconnect, so a restart
+# re-delivers up to 10 minutes of dispatches. spawn's guard absorbs that for
+# work verbs, but `new` deliberately opts out and control verbs would re-run,
+# so remember message ids across restarts and never act on one twice.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clanker"
+mkdir -p "$STATE_DIR"
+SEEN="$STATE_DIR/seen-ids"
+touch "$SEEN"
+
+seen() { grep -qxF "$1" "$SEEN" 2>/dev/null; }
+remember() {
+  echo "$1" >> "$SEEN"
+  # Bound the file: 10m of replay is a handful of ids, 500 is generous.
+  [[ "$(wc -l < "$SEEN")" -gt 500 ]] && { tail -n 250 "$SEEN" > "$SEEN.tmp" && mv "$SEEN.tmp" "$SEEN"; }
+  return 0
+}
+
 echo "listening on $NTFY_TOPIC_URL"
 while true; do
   curl -sN --max-time 0 \
@@ -38,6 +57,12 @@ while true; do
     [[ "$(jq -r '.event // empty' <<< "$line")" == "message" ]] || continue
     msg="$(jq -r '.message // empty' <<< "$line")"
     [[ -n "$msg" ]] || continue
+
+    mid="$(jq -r '.id // empty' <<< "$line")"
+    if [[ -n "$mid" ]]; then
+      seen "$mid" && continue
+      remember "$mid"
+    fi
 
     # Never act on our own confirmations (see ACK_TAG above)
     tags=" $(jq -r '(.tags // []) | join(" ")' <<< "$line") "
@@ -57,6 +82,15 @@ while true; do
     fi
 
     read -r cmd ticket rest <<< "$msg" || true
+
+    # Control verbs are answered by the listener itself — no session spawned,
+    # the reply IS the result. Without these, seeing what's running or reaping
+    # a finished window needs an ssh session, which is exactly what you don't
+    # have when you're dispatching from a phone.
+    case "${cmd:-}" in
+      ping|ls|sessions) echo "control: $cmd"; notify "Sessions" "$("$SESSIONS" list)"; continue ;;
+      sweep)            echo "control: $cmd"; notify "Swept"    "$("$SESSIONS" sweep)"; continue ;;
+    esac
     # Non-dispatch traffic is ignored, but say so in the journal — otherwise a
     # typo'd verb looks exactly like a dead listener from the phone's side.
     # Verb list mirrors bin/spawn; `status` is the one verb that takes no id.

@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap finished clanker session windows
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/clanker/env
+# Grace in minutes: a finished window keeps its scrollback this long before
+# being collected, so a post-mortem is still possible without any manual step.
+ExecStart=%h/.local/bin/sessions sweep 30

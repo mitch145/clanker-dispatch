@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# sessions [list|sweep] — report or reap the tmux windows spawn created.
+#
+# Shared by the Makefile and dispatch-listener so the phone and the box agree
+# on what "finished" means. Output is kept short: it goes into a push.
+set -uo pipefail
+
+ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+SESSION="${CLANKER_TMUX_SESSION:-work}"
+
+# A window's pane_current_command is the wrapper shell, not claude, so liveness
+# has to come from the process table. Anchor the match: plain `=new` is a prefix
+# of `=new-2` and would report a dead window as live.
+is_live() { pgrep -f -- "--remote-control=$1( |\$)" >/dev/null 2>&1; }
+
+# Only ever touch windows spawn made — never a shell you opened yourself.
+is_spawned() {
+  case "$1" in
+    ship-*|plan-*|style-*|cleanup-*|review-*|revise-*|status|new|new-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+windows() { tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null; }
+
+cmd="${1:-list}"
+
+tmux has-session -t "$SESSION" 2>/dev/null || { echo "no tmux session '$SESSION'"; exit 0; }
+
+case "$cmd" in
+  list)
+    live=0; done_=0; out=""
+    for w in $(windows); do
+      is_spawned "$w" || continue
+      if is_live "$w"; then out+="▶ $w"$'\n'; live=$((live+1))
+      else                   out+="✓ $w"$'\n'; done_=$((done_+1)); fi
+    done
+    [[ -n "$out" ]] || { echo "no sessions"; exit 0; }
+    printf '%s' "$out"
+    echo "$live running, $done_ finished"
+    ;;
+  sweep)
+    # Optional grace in minutes. Windows outlive claude so the scrollback is
+    # there for a post-mortem; reaping instantly would defeat that, so the
+    # timer passes a grace period and only long-idle windows get collected.
+    grace="${2:-0}"
+    now="$(date +%s)"
+    n=0; kept=0; young=0
+    while read -r w act; do
+      is_spawned "$w" || continue
+      if is_live "$w"; then kept=$((kept+1)); continue; fi
+      if (( grace > 0 && now - act < grace * 60 )); then young=$((young+1)); continue; fi
+      tmux kill-window -t "$SESSION:$w" 2>/dev/null && n=$((n+1))
+    done < <(tmux list-windows -t "$SESSION" -F '#W #{window_activity}' 2>/dev/null)
+    echo "swept $n finished, kept $kept running${young:+, $young too recent}"
+    ;;
+  *)
+    echo "usage: sessions [list|sweep]" >&2; exit 64 ;;
+esac
