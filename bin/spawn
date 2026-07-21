@@ -23,6 +23,13 @@ REPO="${CLANKER_REPO:?set CLANKER_REPO in $ENV_FILE}"
 SESSION="${CLANKER_TMUX_SESSION:-work}"
 GH_REPO="${CLANKER_GH_REPO:-slate-technologies/slate}"
 
+# Dispatched sessions start unattended, so `manual` (the CLI default) means they
+# sit waiting on a keystroke nobody is at the box to give. `auto` is the point of
+# the pipeline. Set empty to inherit the CLI default; `bypassPermissions` exists
+# but don't — the whole permission model here is "allowlist in the target repo,
+# approve the rest from the phone".
+PERM_MODE="${CLANKER_PERMISSION_MODE-auto}"
+
 EX_SKIP=3   # window already exists — a no-op, not a failure
 
 usage() {
@@ -157,6 +164,7 @@ fi
 # survives claude exiting and the scrollback is there for a post-mortem.
 cmdline="cd $(printf %q "$REPO") && $(printf %q "$claude_bin")"
 cmdline+=" -n $(printf %q "$label") --remote-control=$(printf %q "$label")"
+[[ -n "$PERM_MODE" ]] && cmdline+=" --permission-mode $(printf %q "$PERM_MODE")"
 # Omit the prompt arg entirely when empty — an empty string is still an
 # argument, and `claude ''` is not the same as `claude`.
 [[ -n "$prompt" ]] && cmdline+=" $(printf %q "$prompt")"

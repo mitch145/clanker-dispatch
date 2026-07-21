@@ -169,8 +169,11 @@ Anthropic's channel.
   a redelivery must not push a confirmation that nothing actually began.
   `new` opts out and suffixes (`new-2`), being a blank session rather than
   a claim on a work item.
+- Sessions run with `--permission-mode auto` (`CLANKER_PERMISSION_MODE`).
+  The CLI default is `manual`, which leaves an unattended session waiting on
+  a keystroke nobody is at the box to give.
 - Permission model: do NOT run these sessions with
-  `--dangerously-skip-permissions`. Instead allowlist the tools your
+  `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`. Instead allowlist the tools your
   `sl-*` flows use in the repo's `.claude/settings.json`
   (`permissions.allow`) and approve the rest from the phone via
   Remote Control pushes.
