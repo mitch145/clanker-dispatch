@@ -5,7 +5,13 @@ UNIT  := ntfy-dispatch
 ENV   := $(HOME)/.config/clanker/env
 
 .DEFAULT_GOAL := help
-.PHONY: help install start stop restart status logs sitrep doctor dispatch topic
+.PHONY: help install start stop restart status logs sitrep doctor dispatch topic \
+        sessions sweep kill worktrees
+
+# A window's pane_current_command is the wrapper shell, not claude, so liveness
+# has to come from the process table. Anchor on ( |$) — plain `=new` is a prefix
+# of `=new-2` and would report a dead window as live.
+LIVE = pgrep -f -- "--remote-control=$$w( |$$)" >/dev/null 2>&1
 
 help: ## Show this menu
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) \
@@ -44,6 +50,41 @@ dispatch: ## make dispatch VERB=implement TICKET=1234  (TICKET optional: new, st
 	  curl -sS --max-time 10 -H "Authorization: Bearer $$NTFY_TOKEN" \
 	    -d "$$body" "$$NTFY_TOPIC_URL" >/dev/null \
 	  && echo "published: $$body"
+
+sessions: ## List spawned windows and whether each still has a live claude
+	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
+	tmux has-session -t $$s 2>/dev/null || { echo "  (no tmux session)"; exit 0; }; \
+	for w in $$(tmux list-windows -t $$s -F '#W'); do \
+	  if $(LIVE); then st="LIVE"; else st="finished"; fi; \
+	  printf "  %-18s %s\n" "$$w" "$$st"; \
+	done
+
+# Windows outlive claude on purpose (`exec $$SHELL`) so the scrollback survives
+# for a post-mortem — which means they accumulate until something reaps them.
+sweep: ## Kill finished windows, leave live sessions running
+	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
+	tmux has-session -t $$s 2>/dev/null || { echo "  (no tmux session)"; exit 0; }; \
+	n=0; \
+	for w in $$(tmux list-windows -t $$s -F '#W'); do \
+	  case "$$w" in \
+	    ship-*|plan-*|style-*|cleanup-*|review-*|revise-*|status|new|new-*) ;; \
+	    *) continue ;; \
+	  esac; \
+	  if $(LIVE); then echo "  keep  $$w (live)"; \
+	  else tmux kill-window -t "$$s:$$w" && echo "  swept $$w"; n=$$((n+1)); fi; \
+	done; \
+	echo "  swept $$n window(s)"
+
+kill: ## make kill W=ship-1234 — kill one window, live or not
+	@[[ -n "$(W)" ]] || { echo "usage: make kill W=ship-1234" >&2; exit 2; }
+	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
+	tmux kill-window -t "$$s:$(W)" && echo "  killed $(W)"
+
+worktrees: ## Show git worktrees the sessions have created in the target repo
+	@set -a; . $(ENV); set +a; \
+	git -C "$$CLANKER_REPO" worktree list; \
+	echo "  remove one:  git -C $$CLANKER_REPO worktree remove <path>"; \
+	echo "  or dispatch: cleanup <ticket>   (runs /sl-cleanup, closes the loop properly)"
 
 doctor: ## Check every layer without changing anything
 	@fail=0; \
