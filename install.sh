@@ -38,7 +38,7 @@ if [[ "${NEEDS_EDIT:-0}" == "1" ]]; then
 else
   systemctl --user enable --now ntfy-dispatch
   systemctl --user restart ntfy-dispatch
-  systemctl --user enable --now clanker-sweep.timer
+
   echo ">> Listener enabled and started."
 fi
 echo ">> Verify: journalctl --user -u ntfy-dispatch -f"

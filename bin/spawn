@@ -119,47 +119,32 @@ fi
 [[ -n "$claude_bin" && -x "$claude_bin" ]] \
   || { echo "spawn: claude not found (set CLAUDE_BIN in $ENV_FILE)" >&2; exit 127; }
 
-# Create the tmux server OUTSIDE this process's cgroup when we're the one
-# creating it. Called from the systemd unit, a server started here would inherit
-# the service's resource limits, and every Claude session it holds would then
-# live under a cap meant only to bound the listener.
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  if command -v systemd-run >/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}${XDG_RUNTIME_DIR:-}" ]]; then
-    systemd-run --user --scope --quiet --unit="clanker-tmux-$SESSION" \
-      tmux new-session -d -s "$SESSION" 2>/dev/null \
-      || tmux new-session -d -s "$SESSION"
-  else
-    tmux new-session -d -s "$SESSION"
-  fi
-fi
+agents_json() { timeout 20 "$claude_bin" agents --json 2>/dev/null; }
+
+# Is a session with this name alive right now? `claude agents --json` is the
+# source of truth — it knows about background agents, which have no tmux window
+# and no predictable process name to grep for.
+agent_alive() {
+  agents_json | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1
+}
 
 # Idempotency guard: one window per id. ntfy delivers at least once, and the
 # listener replays `since=10m` on restart, so a redelivered message must not
 # spawn a second session. Deliberately a hard skip, not a -2 suffix: the
 # listener is the reason this exists, and silent double-spawn is the worse bug.
-if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label"; then
-  # Only a *live* session blocks a re-dispatch. Windows outlive claude on
-  # purpose (scrollback for a post-mortem), so testing mere existence would
-  # refuse to re-run finished work until the sweeper got round to it — and
-  # report "Already up" about a session that ended half an hour ago.
+# Only a *live* session blocks a re-dispatch. A finished agent leaves its name
+# free, so re-running completed work just works instead of reporting "Already
+# up" about something that ended half an hour ago.
+if agent_alive "$label"; then
   if [[ "$dedupe" == skip ]]; then
-    if pgrep -f -- "--remote-control=$label( |\$)" >/dev/null 2>&1; then
-      echo "window $label already exists; skipping" >&2
-      exit "$EX_SKIP"
-    fi
-    # Reaped, so the name is free again — reuse it rather than falling through
-    # to the suffix branch, which would leave you with ship-1234-2 for what is
-    # simply the current session for that ticket.
-    echo "reaping finished window $label" >&2
-    tmux kill-window -t "$SESSION:$label" 2>/dev/null || true
-  else
-    # Suffix is -N, never .N: a dot collides with tmux's session:window.pane syntax.
-    n=2
-    while tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$label-$n"; do
-      n=$((n + 1))
-    done
-    label="$label-$n"
+    echo "session $label is already running; skipping" >&2
+    exit "$EX_SKIP"
   fi
+  # `new` is a blank session, not a claim on a work item — running two is
+  # legitimate. Suffix is -N, never .N, to stay tmux-target-safe if attached.
+  n=2
+  while agent_alive "$label-$n"; do n=$((n + 1)); done
+  label="$label-$n"
 fi
 
 # Name the session twice over, both matching the tmux window:
@@ -174,14 +159,24 @@ fi
 # apostrophe ("don't rebase") would otherwise break out of the quoting.
 # -d so an attached client doesn't lose focus; `exec $SHELL` so the window
 # survives claude exiting and the scrollback is there for a post-mortem.
-cmdline="cd $(printf %q "$REPO") && $(printf %q "$claude_bin")"
-cmdline+=" -n $(printf %q "$label") --remote-control=$(printf %q "$label")"
-[[ -n "$PERM_MODE" ]] && cmdline+=" --permission-mode $(printf %q "$PERM_MODE")"
+args=(-n "$label" --remote-control="$label" --bg)
+[[ -n "$PERM_MODE" ]] && args+=(--permission-mode "$PERM_MODE")
 # Omit the prompt arg entirely when empty — an empty string is still an
 # argument, and `claude ''` is not the same as `claude`.
-[[ -n "$prompt" ]] && cmdline+=" $(printf %q "$prompt")"
-cmdline+="; exec ${SHELL:-/bin/bash}"
+[[ -n "$prompt" ]] && args+=("$prompt")
 
-tmux new-window -d -t "$SESSION" -n "$label" "$cmdline"
+# Launch OUTSIDE this process's cgroup. --bg agents are children of whoever
+# started them, so one dispatched by the systemd unit would be killed the next
+# time the listener restarts — `make restart` would silently take out every
+# running agent. A transient scope makes them independent of us.
+cd "$REPO"
+if command -v systemd-run >/dev/null && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  systemd-run --user --scope --quiet --collect \
+    --unit="clanker-agent-$label-$$" \
+    "$claude_bin" "${args[@]}" >/dev/null 2>&1 \
+    || "$claude_bin" "${args[@]}" >/dev/null 2>&1
+else
+  "$claude_bin" "${args[@]}" >/dev/null 2>&1
+fi
 
-echo "spawned [$SESSION:$label] ${prompt:-(bare session)}"
+echo "spawned [$label] ${prompt:-(bare session)}"

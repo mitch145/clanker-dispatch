@@ -3,13 +3,13 @@
 Fire-and-forget Claude Code session dispatch for the clanker box.
 
 Publish `implement 1234` to an ntfy topic from your phone → a Claude Code
-session spawns in a tmux window on this machine → the session self-registers
+background agent starts on this machine → the session self-registers
 with Remote Control → you manage it entirely from the Claude mobile app.
 
 ```
 ┌─────────┐  push msg   ┌──────────┐  spawns   ┌─────────────┐
-│ ntfy app │ ──────────▶ │ listener │ ────────▶ │ tmux window │
-│ (phone)  │ ◀────────── │ (systemd)│           │ claude /sl-*│
+│ ntfy app │ ──────────▶ │ listener │ ────────▶ │ bg agent    │
+│ (phone)  │ ◀────────── │ (systemd)│           │ claude --bg │
 └─────────┘  "Spawned"  └──────────┘           └──────┬──────┘
       ▲                                               │ Remote Control
       │              push notifications               ▼ auto-register
@@ -23,8 +23,9 @@ with Remote Control → you manage it entirely from the Claude mobile app.
 
 | Path | Purpose |
 |---|---|
-| `bin/spawn` | Creates a tmux window running a named Claude session per the verb map. Idempotent per action+id. |
+| `bin/spawn` | Starts a named background agent (`claude --bg`) per the verb map. Idempotent per action+id. |
 | `bin/dispatch-listener` | Subscribes to the ntfy topic over raw HTTP, validates messages (text or JSON), calls `spawn`, publishes confirmation. |
+| `bin/sessions` | Lists/stops dispatched sessions via `claude agents --json`. Shared by the Makefile and the listener. |
 | `bin/sitrep` | One-screen box/session health check for low-bandwidth diagnosis over mosh. |
 | `systemd/ntfy-dispatch.service` | User unit keeping the listener alive across crashes and reboots. |
 | `Makefile` | Ops wrapper — `make doctor` checks every layer without changing anything. |
@@ -82,7 +83,7 @@ From the phone, publish: `implement 9999` (9999 is deliberately not a real
 ticket). Expect, in order:
 
 1. Journal shows `dispatch: implement 9999` and the spawn
-2. `tmux list-windows -t work` shows a `ship-9999` window
+2. `make sessions` shows `ship-9999`
 3. "Spawned" push arrives on the phone
 4. Session appears in Claude app → Code tab within ~15s, named `ship-9999`
 5. It stops within seconds on a tool permission prompt — approve from the
@@ -90,7 +91,7 @@ ticket). Expect, in order:
    allowlisting the tool in the target repo.
 6. Publishing `implement 9999` again pushes "Already up", not "started"
 
-Kill the test window: `tmux kill-window -t work:ship-9999`
+Stop it: `make kill N=ship-9999` (or `claude stop <short-id>`).
 
 `make dispatch VERB=new` is the cheapest smoke test — a bare session with no
 slash command, nothing to damage.
@@ -104,7 +105,7 @@ slash command, nothing to damage.
 Each verb answers to both the intent word and its command's own name, so you
 never have to recall which vocabulary this wants:
 
-| verb | slash command | id space | window |
+| verb | slash command | id space | session name |
 |---|---|---|---|
 | `implement` / `ship` | `/sl-ship` | ticket | `ship-1234` |
 | `plan` | `/sl-plan` | ticket | `plan-1234` |
@@ -120,9 +121,10 @@ never have to recall which vocabulary this wants:
   `/sl-review` takes a URL and not a ticket — the two id spaces are
   different and don't share validation.
 - Trailing text is appended after ` — `. For `new` it *is* the prompt.
-- Window name is `<action>-<number>`, keyed on the action as well as the id:
+- Session name is `<action>-<number>`, keyed on the action as well as the id:
   reviewing a PR and then revising it is an ordinary sequence and must not
-  collide. It doubles as the session name in the Claude app.
+  collide. It's the name you see in the Claude app, and the handle for
+  `claude attach` / `claude logs` / `sessions stop`.
 
 ### Sending from a phone
 
@@ -163,7 +165,7 @@ Anthropic's channel.
   strings reach the shell, and `spawn` runs every interpolation through
   `printf %q`, so a free-text tail containing `; touch /tmp/PWNED` arrives
   as literal prompt text rather than a command.
-- `spawn` is idempotent per action+id (tmux window name check), so replay
+- `spawn` is idempotent per action+id (checked against `claude agents`), so replay
   after listener restart (`since=10m`) can't double-spawn. It exits 3 on a
   skip, which the listener reports as "Already up" rather than "started" —
   a redelivery must not push a confirmation that nothing actually began.
@@ -188,8 +190,11 @@ make status     # is the listener up
 make restart    # after editing bin/ or the env file
 make topic      # the topic name to subscribe to on a phone
 make dispatch VERB=implement TICKET=1234   # publish from the box itself
+make sessions   # what's running, from claude agents
+make kill N=ship-1234                      # stop one background agent
+claude attach <short-id>                   # take over a session in this terminal
+claude logs <short-id>                     # read its recent output
 sitrep          # box + session overview
-tmux attach -t work                        # post-mortem a session locally
 ```
 
 Known failure modes:
@@ -210,14 +215,13 @@ Known failure modes:
   `linear-server` produces `mcp__linear-server__*`, which `mcp__linear__*`
   does **not** match.
 - **Session vanished from app** → box offline >10 min kills Remote Control
-  registration; the tmux window and session survive locally. Re-run
-  `/remote-control` in the window or restart the task.
-- **tmux server disappears with no OOM line in dmesg and free memory
-  system-wide** → a cgroup-local kill. Do not put `MemoryMax` on the unit:
-  a tmux server created by the listener inherits the service cgroup, so a cap
-  meant to bound a bash+curl loop ends up bounding every Claude session it
-  holds. `spawn` also starts the server via `systemd-run --user --scope` to
-  escape that cgroup.
+  registration; the agent survives locally. Reattach with
+  `claude attach <short-id>` or restart the task.
+- **Agents die whenever the listener restarts** → they were started inside the
+  service cgroup. `--bg` agents are children of whoever launched them, so
+  `spawn` starts them under `systemd-run --user --scope` to make them
+  independent. Never put `MemoryMax` on the unit either: a cap meant to bound
+  a bash+curl loop would bound every session it holds.
 
 ## Retirement criteria
 

@@ -107,16 +107,16 @@ while true; do
     # have when you're dispatching from a phone.
     case "${cmd:-}" in
       ping|ls|sessions) echo "control: $cmd"; notify "Sessions" "$("$SESSIONS" list)"; continue ;;
-      sweep)            echo "control: $cmd"; notify "Swept"    "$("$SESSIONS" sweep)"; continue ;;
+      stop)             echo "control: $cmd ${ticket:-}"; notify "Stop" "$("$SESSIONS" stop "${ticket:-}")"; continue ;;
     esac
     # Non-dispatch traffic is ignored, but say so in the journal — otherwise a
     # typo'd verb looks exactly like a dead listener from the phone's side.
     # Verb list mirrors bin/spawn; `status` is the one verb that takes no id.
-    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|new|session)$ ]]; then
+    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|new|session|stop)$ ]]; then
       echo "ignored (not a dispatch): $msg"
       continue
     fi
-    if ! [[ "$cmd" =~ ^(status|new|session)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
+    if ! [[ "$cmd" =~ ^(status|new|session|stop)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
       echo "ignored (bad id): $msg"
       continue
     fi

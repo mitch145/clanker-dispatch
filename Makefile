@@ -6,7 +6,7 @@ ENV   := $(HOME)/.config/clanker/env
 
 .DEFAULT_GOAL := help
 .PHONY: help install start stop restart status logs sitrep doctor dispatch topic \
-        sessions sweep kill worktrees
+        sessions kill worktrees
 
 help: ## Show this menu
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) \
@@ -46,18 +46,12 @@ dispatch: ## make dispatch VERB=implement TICKET=1234  (TICKET optional: new, st
 	    -d "$$body" "$$NTFY_TOPIC_URL" >/dev/null \
 	  && echo "published: $$body"
 
-sessions: ## List spawned windows and whether each still has a live claude
+sessions: ## What's running right now, from claude agents
 	@./bin/sessions list
 
-# Windows outlive claude on purpose (`exec $$SHELL`) so the scrollback survives
-# for a post-mortem — which means they accumulate until something reaps them.
-sweep: ## Kill finished windows, leave live sessions running
-	@./bin/sessions sweep
-
-kill: ## make kill W=ship-1234 — kill one window, live or not
-	@[[ -n "$(W)" ]] || { echo "usage: make kill W=ship-1234" >&2; exit 2; }
-	@set -a; . $(ENV); set +a; s=$${CLANKER_TMUX_SESSION:-work}; \
-	tmux kill-window -t "$$s:$(W)" && echo "  killed $(W)"
+kill: ## make kill N=ship-1234 — stop one background agent
+	@[[ -n "$(N)" ]] || { echo "usage: make kill N=ship-1234" >&2; exit 2; }
+	@./bin/sessions stop "$(N)"
 
 worktrees: ## Show git worktrees the sessions have created in the target repo
 	@set -a; . $(ENV); set +a; \
@@ -67,7 +61,7 @@ worktrees: ## Show git worktrees the sessions have created in the target repo
 
 doctor: ## Check every layer without changing anything
 	@fail=0; \
-	for d in curl jq tmux claude; do \
+	for d in curl jq claude; do \
 	  command -v $$d >/dev/null && echo "  ok    dep $$d" || { echo "  FAIL  dep $$d missing"; fail=1; }; \
 	done; \
 	if [[ -f $(ENV) ]]; then \
