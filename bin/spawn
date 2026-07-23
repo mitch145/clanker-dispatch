@@ -36,14 +36,19 @@ usage() {
   cat >&2 <<'EOF'
 usage: spawn <verb> [id] [extra context...]
 
-  implement|ship 1234   -> /sl-ship SLATE-1234       (keyed by ticket)
-  plan           1234   -> /sl-plan SLATE-1234
-  style          1234   -> /sl-style SLATE-1234
-  cleanup        1234   -> /sl-cleanup SLATE-1234
-  review         3771   -> /sl-review <pr url>       (keyed by PR number)
-  continue|revise 3771  -> /sl-revise 3771
+Every id is a TICKET number — the number you have in front of you. For the
+verbs whose slash command wants a PR, the ticket is resolved to its PR first.
+
+  implement|ship 5506   -> /sl-ship SLATE-5506
+  plan           5506   -> /sl-plan SLATE-5506
+  style          5506   -> /sl-style SLATE-5506
+  cleanup        5506   -> /sl-cleanup SLATE-5506
+  review         5506   -> /sl-review <url of the PR for SLATE-5506>
+  continue|revise 5506  -> /sl-revise <PR for SLATE-5506>
   status                -> /sl-status                (no id)
   new|session [text...]  -> bare claude session in the repo
+
+A number with no PR referencing it is passed through as a literal PR number.
 EOF
   exit 64
 }
@@ -82,6 +87,43 @@ dedupe=skip
 # reviewing a PR then revising it is an ordinary sequence that must not trip
 # the idempotency guard. It doubles as the session name in the Claude app, so
 # it has to say what the session is doing, not just which number it concerns.
+gh_bin="$(command -v gh || true)"
+[[ -x "$gh_bin" ]] || gh_bin=""
+
+# Ticket numbers and PR numbers are different id spaces that look identical.
+# In slate they don't even overlap yet — tickets are ~5500, PRs ~3900 — so
+# `continue 5506` meant `/sl-revise 5506`, a PR that does not exist. Silent,
+# because the session starts fine and only the agent discovers there's nothing
+# there. One day the ranges WILL cross and it stops being silent: it becomes
+# revising a real, unrelated PR.
+#
+# You dispatch by ticket, because that's the number you have in front of you.
+# So ask GitHub which PR carries the ticket. Fall back to using the number
+# literally when nothing matches, so a genuine PR number still works.
+# `gh --search` alone is far too loose to trust here: it tokenises, so
+# "SLATE-999999" happily returns a PR that merely mentions SLATE. Anchor the
+# search to the title AND re-check each hit against the exact ticket, or this
+# silently dispatches at whatever PR the search felt like returning.
+# Prefer open PRs, then the newest — a ticket can have a stack.
+resolve_pr() {
+  local n="$1" found=""
+  if [[ -n "$gh_bin" ]]; then
+    found="$(timeout 25 "$gh_bin" pr list --repo "$GH_REPO" --search "SLATE-$n in:title" \
+               --state all --limit 10 --json number,state,title 2>/dev/null \
+             | jq -r --arg t "SLATE-$n" '
+                 map(select(.title | test("\\b" + $t + "\\b"; "i")))
+                 | (map(select(.state == "OPEN")) | select(length > 0)) // .
+                 | max_by(.number).number // empty' 2>/dev/null)"
+  fi
+  if [[ "$found" =~ ^[0-9]+$ ]]; then
+    echo "$found"
+  else
+    # No PR carries this ticket. Use the number as given: it may genuinely be a
+    # PR number, and guessing is worse than being literal.
+    echo "$n"
+  fi
+}
+
 if [[ "$idstyle" == none ]]; then
   id=""; label="$act"
 else
@@ -89,11 +131,13 @@ else
   raw="${1#SLATE-}"; raw="${raw#slate-}"; raw="${raw#\#}"
   shift
   [[ "$raw" =~ ^[0-9]{1,6}$ ]] || { echo "spawn: bad id '$raw' (digits only)" >&2; exit 64; }
+  # Label by what you typed, not what it resolved to: you dispatched 5506 and
+  # that's the number you'll look for in the list.
   label="$act-$raw"
   case "$idstyle" in
     ticket) id="SLATE-$raw" ;;
-    prurl)  id="https://github.com/$GH_REPO/pull/$raw" ;;
-    pr)     id="$raw" ;;
+    prurl)  id="https://github.com/$GH_REPO/pull/$(resolve_pr "$raw")" ;;
+    pr)     id="$(resolve_pr "$raw")" ;;
   esac
 fi
 
@@ -179,4 +223,11 @@ else
   "$claude_bin" "${args[@]}" >/dev/null 2>&1
 fi
 
-echo "spawned [$label] ${prompt:-(bare session)}"
+# Say what the ticket resolved to. The label is the ticket you typed, so
+# without this line there's nothing anywhere that records which PR the session
+# was actually pointed at.
+if [[ "$idstyle" =~ ^(pr|prurl)$ && "${id##*/}" != "$raw" ]]; then
+  echo "spawned [$label] SLATE-$raw -> PR ${id##*/}"
+else
+  echo "spawned [$label] ${prompt:-(bare session)}"
+fi
