@@ -223,6 +223,20 @@ else
   "$claude_bin" "${args[@]}" >/dev/null 2>&1
 fi
 
+# Record what was dispatched. The board is built from open PRs, but a ticket
+# you've only just started has no PR yet and would be invisible for the twenty
+# minutes that matters most — right after you kicked it off from a train.
+if [[ -n "${raw:-}" ]]; then
+  hist="${XDG_STATE_HOME:-$HOME/.local/state}/clanker/dispatched.jsonl"
+  mkdir -p "$(dirname "$hist")"
+  printf '{"at":%s,"verb":%s,"ticket":%s,"label":%s}\n' \
+    "$(date +%s)" "\"$act\"" "\"$raw\"" "\"$label\"" >> "$hist"
+  # Bound it; this is a recency window, not an archive.
+  if [[ "$(wc -l < "$hist" 2>/dev/null || echo 0)" -gt 400 ]]; then
+    tail -n 200 "$hist" > "$hist.tmp" && mv "$hist.tmp" "$hist"
+  fi
+fi
+
 # Say what the ticket resolved to. The label is the ticket you typed, so
 # without this line there's nothing anywhere that records which PR the session
 # was actually pointed at.

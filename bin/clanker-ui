@@ -19,6 +19,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -221,6 +222,160 @@ def session_detail(short):
     return data
 
 
+# ---- the board -----------------------------------------------------------
+# The Claude app is where you answer an agent. This is where you decide what to
+# start next, so the row is a TICKET and its lifecycle, not a session. What you
+# want on a train is "SLATE-5507's checks are failing" — a session list can
+# never tell you that, because the session ended an hour ago.
+GH_REPO = os.environ.get("CLANKER_GH_REPO", "slate-technologies/slate")
+TICKET_RE = re.compile(r"SLATE-(\d{1,6})", re.I)
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "clanker"
+
+_board = {"at": 0.0, "data": None}
+_board_lock = threading.Lock()
+BOARD_TTL = 60.0  # a gh round trip is seconds, and PR state does not move fast
+
+
+def gh_prs():
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    try:
+        out = subprocess.run(
+            [gh, "pr", "list", "--repo", GH_REPO, "--author", "@me", "--state", "open",
+             "--limit", "40", "--json",
+             "number,title,isDraft,reviewDecision,updatedAt,url,statusCheckRollup"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+        return json.loads(out) if out.strip() else []
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+
+
+def check_summary(pr):
+    """(failed, pending, total) across the PR's checks."""
+    rollup = pr.get("statusCheckRollup") or []
+    failed = pending = 0
+    for c in rollup:
+        concl = (c.get("conclusion") or "").upper()
+        status = (c.get("status") or "").upper()
+        if concl in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"):
+            failed += 1
+        elif not concl and status in ("IN_PROGRESS", "QUEUED", "PENDING", ""):
+            pending += 1
+    return failed, pending, len(rollup)
+
+
+def next_action(pr, agent_phase):
+    """What to dispatch next, and why. Order matters: the first true thing wins,
+    and 'something is already working on it' outranks every suggestion."""
+    if agent_phase == "blocked":
+        return None, "waiting on you", "blocked"
+    if agent_phase in ("busy", "idle"):
+        return None, "agent in flight", "flight"
+    if pr is None:
+        return "implement", "no PR yet", "todo"
+    failed, pending, total = check_summary(pr)
+    if failed:
+        return "continue", "%d check%s failing" % (failed, "" if failed == 1 else "s"), "bad"
+    if pr.get("isDraft"):
+        return "continue", "draft", "todo"
+    rd = (pr.get("reviewDecision") or "").upper()
+    if rd == "CHANGES_REQUESTED":
+        return "continue", "changes requested", "bad"
+    if rd == "APPROVED":
+        if pending:
+            return None, "approved · %d check%s running" % (pending, "" if pending == 1 else "s"), "flight"
+        return None, "approved · ready to merge", "good"
+    if pending:
+        return None, "%d check%s running" % (pending, "" if pending == 1 else "s"), "flight"
+    return "review", "needs review", "todo"
+
+
+def recent_dispatches(limit=40):
+    """Tickets dispatched lately, so one with no PR yet is still on the board."""
+    f = STATE_DIR / "dispatched.jsonl"
+    out = {}
+    try:
+        for line in f.read_text().splitlines()[-limit:]:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = str(d.get("ticket") or "")
+            if t:
+                out[t] = max(out.get(t, 0), int(d.get("at") or 0))
+    except OSError:
+        pass
+    return out
+
+
+def board(force=False):
+    now = time.time()
+    with _board_lock:
+        if not force and _board["data"] is not None and now - _board["at"] < BOARD_TTL:
+            cached = _board["data"]
+        else:
+            cached = None
+    if cached is None:
+        prs = gh_prs()
+        with _board_lock:
+            _board["at"] = now
+            _board["data"] = prs
+        cached = prs
+
+    # Live agent phase per ticket. spawn labels sessions <action>-<ticket>, so
+    # the ticket is recoverable from the name without another lookup.
+    phase_by_ticket = {}
+    for a in (agents() or []):
+        m = re.match(r"^[a-z]+-(\d{1,6})(?:-\d+)?$", a.get("name") or "")
+        if not m or "status" not in a:
+            continue
+        ph = "blocked" if a.get("state") == "blocked" else (a.get("status") or "idle")
+        # blocked beats busy beats idle if a ticket somehow has two sessions
+        rank = {"blocked": 0, "busy": 1, "idle": 2}
+        cur = phase_by_ticket.get(m.group(1))
+        if cur is None or rank.get(ph, 9) < rank.get(cur, 9):
+            phase_by_ticket[m.group(1)] = ph
+
+    rows, seen = [], set()
+    for pr in (cached or []):
+        m = TICKET_RE.search(pr.get("title") or "")
+        ticket = m.group(1) if m else None
+        key = ticket or ("pr%s" % pr.get("number"))
+        if key in seen:
+            continue
+        seen.add(key)
+        ph = phase_by_ticket.get(ticket or "")
+        verb, why, tone = next_action(pr, ph)
+        failed, pending, total = check_summary(pr)
+        rows.append({
+            "ticket": ticket, "pr": pr.get("number"), "url": pr.get("url"),
+            "title": TICKET_RE.sub("", pr.get("title") or "").strip(" -—:"),
+            "draft": bool(pr.get("isDraft")),
+            "review": pr.get("reviewDecision") or "",
+            "failed": failed, "pending": pending, "checks": total,
+            "phase": ph, "next": verb, "why": why, "tone": tone,
+            "updatedAt": pr.get("updatedAt") or "",
+        })
+
+    for ticket, at in recent_dispatches().items():
+        if ticket in seen:
+            continue
+        seen.add(ticket)
+        ph = phase_by_ticket.get(ticket)
+        verb, why, tone = next_action(None, ph)
+        rows.append({
+            "ticket": ticket, "pr": None, "url": None, "title": "",
+            "draft": False, "review": "", "failed": 0, "pending": 0, "checks": 0,
+            "phase": ph, "next": verb, "why": why, "tone": tone, "updatedAt": "",
+        })
+
+    tone_rank = {"blocked": 0, "bad": 1, "todo": 2, "flight": 3, "good": 4}
+    rows.sort(key=lambda r: (tone_rank.get(r["tone"], 9), -(int(r["ticket"] or 0))))
+    return {"rows": rows, "gh": cached is not None}
+
+
 def run(cmd, timeout=30):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -320,6 +475,10 @@ class Handler(BaseHTTPRequestHandler):
                 # so anything running on another machine is invisible here.
                 "host": os.uname().nodename,
             })
+
+        if path == "/api/board":
+            return self.send_json({"ok": True, **board(
+                "force" in parse_qs(urlparse(self.path).query))})
 
         if path == "/api/session":
             # Lazy and per-session: `claude logs` is slow, so it's fetched only
