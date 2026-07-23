@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""clanker-ui — mobile control panel for dispatched Claude sessions.
+
+Serves a single-page app over the tailnet so a phone can list running agents,
+dispatch new ones and stop finished ones without going through ntfy. The ntfy
+path still exists and still works; this is the low-latency one for when the
+box is reachable, and it is the thing ntfy can never be — a live view.
+
+Deliberately python3 stdlib only. The rest of this project is bash + systemd
+with no build step, and a control panel that needs `npm install` before it can
+tell you what's running is a control panel you can't fix from a phone.
+
+Config (from ~/.config/clanker/env, same file as everything else):
+  CLANKER_UI_TOKEN   required — shared secret. No token, no start.
+  CLANKER_UI_PORT    default 8787
+  CLANKER_UI_BIND    default 0.0.0.0
+"""
+import hmac
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+HERE = Path(__file__).resolve().parent
+UI_DIR = HERE.parent / "ui"
+SPAWN = HERE / "spawn"
+SESSIONS = HERE / "sessions"
+
+# The env file is sourced by the systemd unit via EnvironmentFile, but this also
+# runs by hand (`make ui-fg`) where nothing has loaded it. Parse it ourselves so
+# both paths behave identically. Shell-quote-lite: enough for KEY=value and
+# KEY="value", which is all the file ever contains.
+def load_env():
+    path = Path(os.environ.get("CLANKER_ENV", Path.home() / ".config/clanker/env"))
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        os.environ.setdefault(key, val)
+
+
+load_env()
+
+TOKEN = os.environ.get("CLANKER_UI_TOKEN", "").strip()
+PORT = int(os.environ.get("CLANKER_UI_PORT", "8787"))
+BIND = os.environ.get("CLANKER_UI_BIND", "0.0.0.0")
+REPO = os.environ.get("CLANKER_REPO", "")
+
+# Fail closed. Binding 0.0.0.0 under WSL mirrored networking puts this on the
+# LAN as well as the tailnet, and an unauthenticated endpoint here spawns
+# arbitrary agents on the box.
+if not TOKEN or TOKEN in ("REPLACE_ME", "changeme"):
+    sys.exit(
+        "clanker-ui: CLANKER_UI_TOKEN unset in the env file.\n"
+        "  generate one:  openssl rand -hex 16"
+    )
+
+# The four verbs actually used. spawn still understands plan/style/cleanup/status;
+# they're just not on the panel, because a control panel you scan one-handed
+# should offer what you reach for daily and nothing else.
+VERBS = ["implement", "continue", "review", "new"]
+SHORTHAND = {"implement": "csli", "continue": "cslc", "review": "cslr", "new": "csln"}
+ID_RE = re.compile(r"^(SLATE-|slate-|#)?[0-9]{1,6}$", re.I)
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+SHORT_RE = re.compile(r"^[A-Za-z0-9]{4,36}$")
+
+# `claude logs` emits the session's raw terminal scrollback — a full-screen TUI
+# redrawn many times over, escape codes and all. Two things are worth mining
+# out of it, and both are plain text that survives stripping:
+#   1. the Remote Control deep link, which opens THIS session in the Claude app
+#   2. the last few readable lines, as a "what is it actually doing" preview
+LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9_]+")
+ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+ANSI_CSI = re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+ANSI_ESC = re.compile(r"\x1b[@-Z\\-_]")
+# Chrome that's on every screen and tells you nothing about this session.
+NOISE = re.compile(
+    r"^(?:[─-╿\s]+|.*Claude Code v\d.*|.*Opus 4\.8.*|.*auto mode on.*"
+    r"|.*/remote-control is active.*|.*← for agents.*)$"
+)
+
+# `claude agents --json` is not instant and the page polls. Without a cache,
+# three phones on the same screen would serialise behind each other's subprocess.
+_cache = {"at": 0.0, "data": None}
+_cache_lock = threading.Lock()
+CACHE_TTL = 2.0
+
+
+def agents(force=False):
+    with _cache_lock:
+        if not force and _cache["data"] is not None and time.time() - _cache["at"] < CACHE_TTL:
+            return _cache["data"]
+    claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+    if not os.access(claude, os.X_OK):
+        claude = "claude"
+    try:
+        # --all keeps finished background sessions in the list. Without it a
+        # dispatched agent simply disappears when it completes, and "it finished"
+        # is indistinguishable from "it never started" — which is exactly the
+        # question you're asking when you check this from a phone.
+        out = subprocess.run(
+            [claude, "agents", "--json", "--all"],
+            capture_output=True, text=True, timeout=25,
+        ).stdout
+        data = json.loads(out) if out.strip() else []
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, OSError):
+        data = None  # distinct from [] — "couldn't ask" is not "nothing running"
+    with _cache_lock:
+        _cache["at"] = time.time()
+        _cache["data"] = data
+    return data
+
+
+# `claude agents --json` returns three differently-shaped records and the
+# difference is not documented anywhere, so it's pinned here:
+#
+#   interactive        pid, status(busy|idle), sometimes NO name
+#   background live    pid, id, status(busy|idle), state(blocked|running)
+#   background done    id, state(done|stopped), NO status, NO pid
+#
+# So `status` is absent exactly when the session has finished, which is what
+# makes it a reliable liveness test. Reading `status` alone (as this did at
+# first) reports a finished agent as idle and a blocked one as idle too.
+PHASE_ORDER = {"blocked": 0, "busy": 1, "idle": 2, "stopped": 3, "done": 4}
+
+
+def phase(a):
+    live = "status" in a
+    if not live:
+        return a.get("state") or "done"
+    # blocked outranks busy/idle: it means the agent is waiting on a human, and
+    # on a phone that's the only row you actually need to act on.
+    if a.get("state") == "blocked":
+        return "blocked"
+    return a.get("status") or "idle"
+
+
+def normalise(a):
+    sid = a.get("sessionId") or ""
+    short = a.get("id") or sid[:8]
+    cwd = a.get("cwd") or ""
+    # An interactive session started without -n has no name at all. Dropping
+    # those (the first cut did) hid half the sessions on this box. Derive
+    # something addressable instead: you still want to know they're there.
+    name = a.get("name") or ""
+    return {
+        "name": name or f"({os.path.basename(cwd) or 'session'} {short})",
+        "named": bool(name),
+        "id": short,
+        "repo": os.path.basename(cwd.rstrip("/")) or cwd,
+        "cwd": cwd,
+        "kind": a.get("kind") or "",
+        "phase": phase(a),
+        "live": "status" in a,
+        "startedAt": a.get("startedAt") or 0,
+    }
+
+
+# Deep links never change for a session, so they're cached for the life of the
+# process. The preview does change, so it gets a short TTL of its own.
+_detail = {}
+_links = {}
+_detail_lock = threading.Lock()
+DETAIL_TTL = 8.0
+
+
+def session_detail(short):
+    """Deep link + a readable tail for one background session."""
+    now = time.time()
+    with _detail_lock:
+        hit = _detail.get(short)
+        if hit and now - hit["at"] < DETAIL_TTL:
+            return hit["data"]
+    claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+    if not os.access(claude, os.X_OK):
+        claude = "claude"
+    try:
+        raw = subprocess.run(
+            [claude, "logs", short], capture_output=True, text=True,
+            timeout=25, errors="replace",
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        raw = ""
+
+    link = _links.get(short)
+    found = LINK_RE.search(raw)
+    if found:
+        link = found.group(0)
+        _links[short] = link
+
+    s = ANSI_ESC.sub("", ANSI_CSI.sub("", ANSI_OSC.sub("", raw)))
+    lines = []
+    for ln in s.split("\n"):
+        ln = " ".join(ln.split())
+        if len(ln) < 3 or NOISE.match(ln):
+            continue
+        # The TUI's pane borders are a long box-drawing rule with the session
+        # name welded onto the end, so "is it entirely box-drawing" misses them.
+        # Judge by proportion instead.
+        if sum(1 for c in ln if "─" <= c <= "╿") > len(ln) * 0.5:
+            continue
+        # The TUI redraws the same screen repeatedly; collapse the repeats.
+        if lines and lines[-1] == ln:
+            continue
+        lines.append(ln)
+    data = {"link": link, "preview": lines[-6:]}
+    with _detail_lock:
+        _detail[short] = {"at": now, "data": data}
+    return data
+
+
+def run(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except OSError as e:
+        return 127, str(e)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "clanker-ui"
+    # The page polls every 5s. On HTTP/1.0 (the base class default) that is a
+    # fresh TCP handshake each time, over a phone link. Every response below
+    # sets an accurate Content-Length, which is what makes keep-alive legal.
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # journal gets one tidy line, not two
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    # -- helpers ---------------------------------------------------------
+    def send_json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authed(self):
+        """Token from ?t= (first visit, e.g. a home-screen bookmark) or the
+        cookie it sets. compare_digest so a wrong token can't be found a byte
+        at a time."""
+        q = parse_qs(urlparse(self.path).query)
+        supplied = (q.get("t") or [None])[0]
+        if supplied is None:
+            raw = self.headers.get("Cookie")
+            if raw:
+                c = SimpleCookie(raw)
+                if "clanker_ui" in c:
+                    supplied = c["clanker_ui"].value
+        return supplied is not None and hmac.compare_digest(supplied, TOKEN)
+
+    def deny(self):
+        self.send_json({"error": "unauthorized"}, 401)
+
+    def body_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return {}
+
+    # -- routes ----------------------------------------------------------
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if not self.authed():
+            return self.deny()
+
+        if path in ("/", "/index.html"):
+            f = UI_DIR / "index.html"
+            if not f.is_file():
+                return self.send_json({"error": f"missing {f}"}, 500)
+            body = f.read_bytes()  # read per request: edit the page, pull to refresh
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            # Persist the token so the ?t= URL only has to be opened once. Not
+            # Secure — this is plain HTTP over a tailnet, and marking it Secure
+            # would silently drop it.
+            self.send_header(
+                "Set-Cookie",
+                f"clanker_ui={TOKEN}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly",
+            )
+            self.end_headers()
+            return self.wfile.write(body)
+
+        if path == "/api/state":
+            data = agents(force="force" in parse_qs(urlparse(self.path).query))
+            if data is None:
+                return self.send_json({"ok": False, "error": "could not read agent list"}, 503)
+            rows = [normalise(a) for a in data]
+            # Sort by what needs attention, not alphabetically: blocked, then
+            # working, then idle, then finished. Newest first within a phase.
+            rows.sort(key=lambda r: (PHASE_ORDER.get(r["phase"], 9), -r["startedAt"]))
+            return self.send_json({
+                "ok": True,
+                "agents": rows,
+                "repo": REPO,
+                "verbs": VERBS,
+                "live": sum(1 for r in rows if r["live"]),
+                "blocked": sum(1 for r in rows if r["phase"] == "blocked"),
+                "shorthand": SHORTHAND,
+                # This box only. `claude agents` enumerates local session state,
+                # so anything running on another machine is invisible here.
+                "host": os.uname().nodename,
+            })
+
+        if path == "/api/session":
+            # Lazy and per-session: `claude logs` is slow, so it's fetched only
+            # for the card you actually opened, never for the whole list.
+            sid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+            if not SHORT_RE.match(sid):
+                return self.send_json({"ok": False, "error": "bad id"}, 400)
+            d = session_detail(sid)
+            return self.send_json({"ok": True, **d})
+
+        return self.send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if not self.authed():
+            return self.deny()
+        body = self.body_json()
+
+        if path == "/api/dispatch":
+            verb = str(body.get("verb", "")).strip()
+            ident = str(body.get("id", "")).strip()
+            extra = str(body.get("extra", "")).strip()
+            if verb not in VERBS:
+                return self.send_json({"ok": False, "message": f"unknown verb {verb!r}"}, 400)
+            needs_id = verb not in ("status", "new")
+            if needs_id and not ID_RE.match(ident):
+                return self.send_json({"ok": False, "message": "id must be 1-6 digits"}, 400)
+
+            cmd = [str(SPAWN), verb]
+            if needs_id and ident:
+                cmd.append(ident)
+            if extra:
+                # One argument, not extra.split(): spawn joins its tail with
+                # "$*", so splitting here would collapse runs of whitespace in
+                # a description you typed deliberately. It runs every
+                # interpolation through printf %q, so this stays prompt text.
+                cmd.append(extra)
+            rc, out = run(cmd, timeout=60)
+            _cache["at"] = 0.0  # next poll shows the new agent, not a stale list
+            msg = {0: "started", 3: "already running"}.get(rc, f"failed (exit {rc})")
+            return self.send_json({"ok": rc in (0, 3), "rc": rc, "message": msg, "detail": out})
+
+        if path == "/api/stop":
+            name = str(body.get("name", "")).strip()
+            if not NAME_RE.match(name):
+                return self.send_json({"ok": False, "message": "bad session name"}, 400)
+            rc, out = run([str(SESSIONS), "stop", name], timeout=40)
+            _cache["at"] = 0.0
+            return self.send_json({"ok": rc == 0, "message": out or "stopped"})
+
+        return self.send_json({"error": "not found"}, 404)
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv.daemon_threads = True
+    print(f"clanker-ui on http://{BIND}:{PORT}/?t=<token>", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass

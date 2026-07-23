@@ -26,9 +26,28 @@ for f in bin/*; do
 done
 echo ">> Symlinked $(ls bin | tr '\n' ' ')into ~/.local/bin"
 
-# systemd user unit
+# The UI refuses to start without a token. Mint one on first install rather
+# than leaving a REPLACE_ME that only announces itself as a failed unit later.
+if ! grep -q '^CLANKER_UI_TOKEN=' "$HOME/.config/clanker/env" \
+   || grep -q '^CLANKER_UI_TOKEN=REPLACE_ME' "$HOME/.config/clanker/env"; then
+  tok="$(openssl rand -hex 16)"
+  if grep -q '^CLANKER_UI_TOKEN=' "$HOME/.config/clanker/env"; then
+    sed -i "s|^CLANKER_UI_TOKEN=.*|CLANKER_UI_TOKEN=$tok|" "$HOME/.config/clanker/env"
+  else
+    printf '\n# mobile control panel (bin/clanker-ui)\nCLANKER_UI_TOKEN=%s\nCLANKER_UI_PORT=8787\n' \
+      "$tok" >> "$HOME/.config/clanker/env"
+  fi
+  echo ">> Generated CLANKER_UI_TOKEN."
+fi
+
+# systemd user units. Globbed per-pattern: a bare `cp systemd/*.service
+# systemd/*.timer` fails the whole install the moment one pattern matches
+# nothing, which with `set -e` aborts before anything gets enabled.
 mkdir -p "$HOME/.config/systemd/user"
-cp systemd/*.service systemd/*.timer "$HOME/.config/systemd/user/"
+shopt -s nullglob
+units=(systemd/*.service systemd/*.timer)
+shopt -u nullglob
+(( ${#units[@]} )) && cp "${units[@]}" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 loginctl enable-linger "$USER"
 
@@ -36,9 +55,10 @@ if [[ "${NEEDS_EDIT:-0}" == "1" ]]; then
   echo ">> Now: edit ~/.config/clanker/env, then:"
   echo "   systemctl --user enable --now ntfy-dispatch"
 else
-  systemctl --user enable --now ntfy-dispatch
-  systemctl --user restart ntfy-dispatch
+  systemctl --user enable --now ntfy-dispatch clanker-ui
+  systemctl --user restart ntfy-dispatch clanker-ui
 
-  echo ">> Listener enabled and started."
+  echo ">> Listener and UI enabled and started."
+  echo ">> Phone URL: make ui-url"
 fi
 echo ">> Verify: journalctl --user -u ntfy-dispatch -f"

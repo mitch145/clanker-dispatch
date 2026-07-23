@@ -1,0 +1,17 @@
+[Unit]
+Description=clanker mobile control panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/clanker/env
+ExecStart=%h/.local/bin/clanker-ui
+Restart=always
+RestartSec=10
+
+# Same rule as ntfy-dispatch: no MemoryMax, no Nice. This process shells out to
+# `spawn`, and spawn's `systemd-run --user --scope` escape hatch is belt to this
+# service's braces — don't hand it a cap to escape from in the first place.
+
+[Install]
+WantedBy=default.target

@@ -27,7 +27,10 @@ with Remote Control → you manage it entirely from the Claude mobile app.
 | `bin/dispatch-listener` | Subscribes to the ntfy topic over raw HTTP, validates messages (text or JSON), calls `spawn`, publishes confirmation. |
 | `bin/sessions` | Lists/stops dispatched sessions via `claude agents --json`. Shared by the Makefile and the listener. |
 | `bin/sitrep` | One-screen box/session health check for low-bandwidth diagnosis over mosh. |
+| `bin/clanker-ui` | Mobile control panel: live agent list, dispatch, stop. python3 stdlib, no build step. |
+| `ui/index.html` | The panel itself — one self-contained file, served fresh on each request. |
 | `systemd/ntfy-dispatch.service` | User unit keeping the listener alive across crashes and reboots. |
+| `systemd/clanker-ui.service` | Same, for the control panel. |
 | `Makefile` | Ops wrapper — `make doctor` checks every layer without changing anything. |
 | `.env.example` | Template for `~/.config/clanker/env` (token, topic, repo path). |
 | `install.sh` | Symlinks bin/, installs the unit, enables lingering. |
@@ -142,6 +145,58 @@ implement 9999                  # plain text
 Prefer the `message` form: one shortcut shape covers every verb, and it
 survives appending extra context.
 
+## Control panel
+
+`make ui-url` prints a URL for the phone. Open it once — the `?t=` token is
+stored in a cookie — then Add to Home Screen for a fullscreen app.
+
+It does the things ntfy can't: shows what's running *right now*, reads what an
+agent is currently doing, stops one with a tap, and dispatches without a round
+trip through ntfy.sh. The ntfy path stays — it's the one that works from a
+train, where the box isn't reachable. This one is for when it is.
+
+Five views over the same data, switchable from the header — they're different
+answers to "how do I want to be told", not different features:
+
+| View | For |
+|---|---|
+| **Triage** | The default. Blocked agents get cards, running work collapses to one line, finished rows offer re-dispatch chips. |
+| **Command** | Type your shorthand — `cslc 5507 rebase onto main`. The only view where dispatching *with a description* is one gesture. |
+| **Deck** | One blocked agent per screen. Clearing a queue one-handed. |
+| **Pipeline** | Three lanes: needs you / working / finished. Proportion at a glance. |
+| **Pulse** | One number the size of the screen. For the nineteen checks in twenty that need no action. |
+
+### What it can and can't do
+
+It **cannot answer a permission prompt.** There is no reply command in the CLI,
+and `claude attach` needs a TTY. Driving that with a pseudo-terminal would mean
+firing keystrokes at a prompt whose state you inferred — on a repo where
+sessions run in `auto` mode, a mis-sent approval is a real edit.
+
+So it does the next best thing: `claude logs <id>` leaks the Remote Control deep
+link, and every blocked card carries an **Answer in Claude** button that opens
+*that exact session* in the app. The panel wins the part it can win — telling
+you which agent is stuck, and what it's stuck on, sorted so it's first — and
+hands off the keystroke.
+
+- Binds `0.0.0.0` so it's reachable over Tailscale. Under WSL mirrored
+  networking that also puts it on the LAN, so `CLANKER_UI_TOKEN` is not
+  optional: the server refuses to start without one, and `install.sh` mints it.
+- The panel offers four verbs — `implement`, `continue`, `review`, `new` — each
+  taking a ticket number and an optional description. `spawn` still understands
+  `plan`/`style`/`cleanup`/`status` from ntfy; they're just not on a screen you
+  scan one-handed.
+- Verb list comes from the server, so changing `VERBS` in `bin/clanker-ui`
+  doesn't mean hand-editing the page.
+- The page is re-read from disk per request. Edit `ui/index.html`, pull to
+  refresh — no restart. Restart is only needed for `bin/clanker-ui` itself.
+- Dispatch and stop shell out to `spawn` and `sessions` with an argument list,
+  never a shell string, and re-validate the verb and id server-side. The page
+  is a convenience, not the security boundary.
+
+Not yet: PR/Graphite state, Linear queue, chained dispatch. It's a control
+panel, not the Claude app — steering still happens there.
+
 ### What gets ignored
 
 Non-dispatch traffic is skipped but *logged* (`ignored (not a dispatch): …`)
@@ -185,9 +240,11 @@ Anthropic's channel.
 ```bash
 make            # the menu
 make doctor     # check every layer, change nothing — start here when it breaks
-make logs       # live journal (Ctrl-C exits the view, not the listener)
-make status     # is the listener up
+make logs       # live journal, both units (Ctrl-C exits the view, not the services)
+make status     # are the listener and UI up
 make restart    # after editing bin/ or the env file
+make ui-url     # the URL to open on your phone
+make ui-logs    # just the control panel's log
 make topic      # the topic name to subscribe to on a phone
 make dispatch VERB=implement TICKET=1234   # publish from the box itself
 make sessions   # what's running, from claude agents
