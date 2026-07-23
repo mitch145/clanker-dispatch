@@ -21,20 +21,30 @@ case "${1:-list}" in
   list)
     json="$(agents)"
     [[ -n "$json" ]] || { echo "could not read agent list"; exit 1; }
-    # ▶ busy, ○ idle. Background agents are the dispatched ones; interactive
-    # sessions are you at a keyboard somewhere, and worth telling apart.
+    # Phase, not `.status` alone: a finished background session has no `.status`
+    # field at all, so testing it reports "idle" for something that ended hours
+    # ago, and for one that's blocked waiting on a human. `.status` being absent
+    # is exactly the liveness test. See bin/clanker-ui for the full record shapes.
+    #   ! blocked (wants you)   ▶ busy   ○ idle
+    # Only live sessions are listed — this goes into a push notification, and
+    # finished ones would push the interesting row off the screen.
     printf '%s' "$json" | jq -r '
-      map(select((.name // "") != "")) as $a
-      | if ($a | length) == 0 then "no named sessions"
+      map(select(has("status"))) as $a
+      | if ($a | length) == 0 then "nothing running"
         else
-          ( $a | sort_by(.kind, .name) | map(
-              (if .status == "busy" then "▶ " else "○ " end)
-              + .name
-              + (if .kind == "background" then "" else " (interactive)" end)
-            ) | join("\n") )
+          ( $a
+            | map(. + {ph: (if .state == "blocked" then "blocked" else (.status // "idle") end)})
+            | map(. + {rank: (if .ph == "blocked" then 0 elif .ph == "busy" then 1 else 2 end)})
+            | sort_by(.rank, .name)
+            | map(
+                (if .ph == "blocked" then "! " elif .ph == "busy" then "▶ " else "○ " end)
+                + (.name // "(unnamed \(.sessionId[0:8]))")
+                + (if .kind == "background" then "" else " (interactive)" end)
+              ) | join("\n") )
           + "\n"
-          + (($a | map(select(.status == "busy")) | length | tostring) + " busy, "
-            + ($a | map(select(.status != "busy")) | length | tostring) + " idle")
+          + (($a | map(select(.state == "blocked")) | length | tostring) + " blocked, "
+            + ($a | map(select(.status == "busy")) | length | tostring) + " busy, "
+            + ($a | map(select(.status != "busy" and .state != "blocked")) | length | tostring) + " idle")
         end'
     ;;
   stop)
