@@ -8,8 +8,17 @@ ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
-: "${NTFY_TOKEN:?set NTFY_TOKEN in $ENV_FILE}"
 : "${NTFY_TOPIC_URL:?set NTFY_TOPIC_URL in $ENV_FILE}"
+
+# Token is optional: ntfy.sh allows anonymous pub/sub on unreserved topics —
+# the unguessable topic name is the credential on free tier. A token only
+# matters for reserved topics and higher rate limits. Send the header only
+# when a real one is configured; a placeholder would turn every request
+# into a 401 that looks like a dead listener.
+AUTH=()
+if [[ -n "${NTFY_TOKEN:-}" && "${NTFY_TOKEN}" != tk_replace_me ]]; then
+  AUTH=(-H "Authorization: Bearer $NTFY_TOKEN")
+fi
 
 # Without jq the message filter below evaluates false for every line and the
 # listener silently ignores all dispatches. Fail loudly instead.
@@ -25,8 +34,7 @@ SESSIONS="$BINDIR/sessions"
 ACK_TAG=clanker-ack
 
 notify() { # notify <title> <body> [priority]
-  curl -s --max-time 10 \
-    -H "Authorization: Bearer $NTFY_TOKEN" \
+  curl -s --max-time 10 ${AUTH[@]+"${AUTH[@]}"} \
     -H "Title: $1" -H "Tags: $ACK_TAG" ${3:+-H "Priority: $3"} \
     -d "$2" "$NTFY_TOPIC_URL" >/dev/null || true
 }
@@ -47,10 +55,52 @@ CURSOR="$STATE_DIR/last-seen-ts"
 # while it was down used to fall off the end of a 10m replay and vanish with no
 # error anywhere. Safe only because of the id dedupe below — without that, a
 # wide replay window double-spawns everything.
+#
+# Capped at 30 minutes: with a second box on the same topic, an unbounded
+# cursor means a machine that was off for a week replays a week of dispatches
+# the other box already handled. 30m still covers sleep blips; the ack skip
+# below covers the rest of the window.
+REPLAY_CAP=1800
 since_param() {
-  local ts
+  local ts floor
   ts="$(cat "$CURSOR" 2>/dev/null)"
-  if [[ "$ts" =~ ^[0-9]+$ ]]; then echo "$((ts - 30))"; else echo "10m"; fi
+  floor=$(( $(date +%s) - REPLAY_CAP ))
+  if [[ "$ts" =~ ^[0-9]+$ ]]; then
+    ts=$((ts - 30))
+    (( ts < floor )) && ts=$floor
+    echo "$ts"
+  else
+    echo "10m"
+  fi
+}
+
+# Cross-box dedupe. seen-ids only protects THIS machine; two listeners on one
+# topic (desktop + laptop) would each replay and run a dispatch the other
+# already handled. But the confirmations ride the same topic tagged
+# clanker-ack, so the other box's acks are visible in the replay window —
+# fetch them before connecting and skip any dispatch a later ack answers.
+# The file is static per connection, so a live dispatch can never match:
+# its timestamp postdates every ack fetched at connect time.
+ACKS="$STATE_DIR/replay-acks"
+fetch_acks() { # fetch_acks <since>
+  curl -s --max-time 10 ${AUTH[@]+"${AUTH[@]}"} \
+    "$NTFY_TOPIC_URL/json?poll=1&since=$1" 2>/dev/null \
+  | jq -r 'select(.event == "message")
+           | select((.tags // []) | index("clanker-ack"))
+           | "\(.time) \(.message)"' 2>/dev/null > "$ACKS" || : > "$ACKS"
+}
+
+acked() { # acked <cmd> <ticket> <msg-time> — answered by any box after send?
+  local t rest want
+  want="$1 ${2:-}"; want="${want% }"
+  while read -r t rest; do
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    (( t > $3 )) || continue
+    case "$rest" in
+      "started $want"|"existing session for $want"|"failed $want"|"failed $want ("*) return 0 ;;
+    esac
+  done < "$ACKS"
+  return 1
 }
 
 seen() { grep -qxF "$1" "$SEEN" 2>/dev/null; }
@@ -62,10 +112,12 @@ remember() {
 }
 
 echo "listening on $NTFY_TOPIC_URL"
+START_TS="$(date +%s)"
 while true; do
-  curl -sN --max-time 0 \
-    -H "Authorization: Bearer $NTFY_TOKEN" \
-    "$NTFY_TOPIC_URL/json?since=$(since_param)" | \
+  since="$(since_param)"
+  fetch_acks "$since"
+  curl -sN --max-time 0 ${AUTH[@]+"${AUTH[@]}"} \
+    "$NTFY_TOPIC_URL/json?since=$since" | \
   while read -r line; do
     [[ "$(jq -r '.event // empty' <<< "$line")" == "message" ]] || continue
     msg="$(jq -r '.message // empty' <<< "$line")"
@@ -105,6 +157,15 @@ while true; do
     # the reply IS the result. Without these, seeing what's running or reaping
     # a finished window needs an ssh session, which is exactly what you don't
     # have when you're dispatching from a phone.
+    # Control verbs are point-in-time: answering a replayed `sessions` from
+    # 20 minutes ago is noise, and a replayed `stop` can kill a namesake
+    # session it never meant (the other box already honoured the real one).
+    # Only act on control verbs sent while this listener has been up.
+    if [[ "${cmd:-}" =~ ^(ping|ls|sessions|stop)$ ]] \
+       && ! { [[ "${mtime:-}" =~ ^[0-9]+$ ]] && (( mtime >= START_TS )); }; then
+      echo "skip (stale control verb): $msg"
+      continue
+    fi
     case "${cmd:-}" in
       ping|ls|sessions) echo "control: $cmd"; notify "Sessions" "$("$SESSIONS" list)"; continue ;;
       stop)             echo "control: $cmd ${ticket:-}"; notify "Stop" "$("$SESSIONS" stop "${ticket:-}")"; continue ;;
@@ -118,6 +179,11 @@ while true; do
     fi
     if ! [[ "$cmd" =~ ^(status|new|session|stop)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
       echo "ignored (bad id): $msg"
+      continue
+    fi
+
+    if acked "$cmd" "${ticket:-}" "${mtime:-0}"; then
+      echo "skip (already handled by another box): $msg"
       continue
     fi
 
