@@ -326,7 +326,9 @@
         var h = $("host");
         h.textContent = d.host + " · " + (d.blocked ? d.blocked + " blocked" : d.live + " live");
         h.className = "host mono" + (d.blocked ? " alert" : "");
-        render();
+        // The header above lives outside main and is always safe to update.
+        // The body rebuild is not, while you're typing into it — defer it.
+        if (!isTyping()) render();
       })
       .catch(function () {
         $("health").className = "pip";
@@ -337,7 +339,7 @@
   function refreshBoard(force) {
     return fetch("/api/board" + (force ? "?force=1" : ""), { cache: "no-store" })
       .then(function (r) { return r.json(); })
-      .then(function (d) { if (d.ok) { brd = d; if (view === "board") render(); } })
+      .then(function (d) { if (d.ok) { brd = d; if (view === "board" && !isTyping()) render(); } })
       .catch(function () {});
   }
 
@@ -548,11 +550,34 @@
   }
 
   /* ---------------- render ---------------------------------------------- */
+  // True while a text field has focus. Background polls check this and defer
+  // their DOM rebuild so they can't clear a half-typed command or its caret.
+  function isTyping() {
+    var a = document.activeElement;
+    return !!(a && a.tagName === "INPUT" && a.id);
+  }
+
   function render() {
     var keepScroll = main.scrollTop;
+    // A background poll rebuilds innerHTML every 5s. If you were mid-type in the
+    // command field or the dock, that wipes what you'd typed and the caret with
+    // it — the field cleared before you could send. Carry the focused input
+    // across the rebuild: its id, value and selection.
+    var act = document.activeElement, saved = null;
+    if (act && act.tagName === "INPUT" && act.id) {
+      saved = { id: act.id, val: act.value, s: act.selectionStart, e: act.selectionEnd };
+    }
     main.innerHTML = RENDER[view]();
     dock.innerHTML = dockHTML();
     main.scrollTop = keepScroll;
+    if (saved) {
+      var el = document.getElementById(saved.id);
+      if (el) {
+        el.value = saved.val;
+        el.focus();
+        try { el.setSelectionRange(saved.s, saved.e); } catch (x) {}
+      }
+    }
   }
 
   /* ---------------- events ---------------------------------------------- */
@@ -610,8 +635,10 @@
     var verb = CMD2VERB[key] || key;
     e.target.value = "";
     dispatch(verb, m[2], m[3].trim()).then(function () {
-      var inp = $("cmdin");
-      if (inp) inp.focus();
+      // The background poll deferred its render because the field is focused,
+      // so paint the new log line here. render() carries the (now empty) field
+      // and its focus across the rebuild, keeping the keyboard up for the next.
+      render();
       main.scrollTop = main.scrollHeight;
     });
   });
