@@ -244,6 +244,10 @@ if [[ "$act" == resume ]]; then
          "$msg" >/dev/null 2>&1 </dev/null; then
       echo "resumed [$r_name]"
       count=$((count + 1))
+      # The fork supersedes the old record; rm keeps the agents list from
+      # accreting a "stopped"/shadowed-done corpse per resume. Registration
+      # only — the transcript is untouched.
+      [[ -n "$r_short" ]] && { timeout 25 "$claude_bin" rm "$r_short" >/dev/null 2>&1 || true; }
     else
       echo "resume FAILED [$r_name]" >&2
     fi
@@ -292,7 +296,13 @@ if [[ -n "$rec" ]]; then
     # and must not protect a session whose turn is over. waiting (a real
     # pending prompt) and busy both fall through to the hard skip below.
     reap_short="$(jq -r '.id // empty' <<< "$rec")"
-    [[ -n "$reap_short" ]] && timeout 25 "$claude_bin" stop "$reap_short" >/dev/null 2>&1 || true
+    # stop ends it, rm drops the registration row — without the rm every
+    # reap leaves a permanent "stopped" corpse in `claude agents --all`.
+    # rm is registration-only: the transcript survives and stays resumable.
+    if [[ -n "$reap_short" ]]; then
+      timeout 25 "$claude_bin" stop "$reap_short" >/dev/null 2>&1 || true
+      timeout 25 "$claude_bin" rm "$reap_short" >/dev/null 2>&1 || true
+    fi
     echo "reaped idle session $label (turn was finished)" >&2
   else
     echo "session $label is already running; skipping" >&2
@@ -318,8 +328,10 @@ if [[ "$act" == revise && -n "${raw:-}" ]]; then
   resume_live=""
   IFS=$'\t' read -r resume_sid resume_short resume_live < <(resume_pick "$raw") || true
   if [[ "$resume_live" == "live" && -n "${resume_short:-}" ]]; then
-    # Finished turn, still registered: stop it so the fork is the only writer.
+    # Finished turn, still registered: stop it so the fork is the only
+    # writer, and rm the registration so the supersede leaves no corpse.
     timeout 25 "$claude_bin" stop "$resume_short" >/dev/null 2>&1 || true
+    timeout 25 "$claude_bin" rm "$resume_short" >/dev/null 2>&1 || true
   fi
   [[ -n "$resume_sid" ]] && args=(--resume "$resume_sid" --fork-session "${args[@]}")
 fi

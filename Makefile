@@ -81,6 +81,9 @@ kill: ## make kill N=ship-1234 — stop one background agent
 	@[[ -n "$(N)" ]] || { echo "usage: make kill N=ship-1234" >&2; exit 2; }
 	@./bin/sessions stop "$(N)"
 
+prune: ## Delete superseded session records (stopped + shadowed-done rows)
+	@./bin/sessions prune
+
 worktrees: ## Show git worktrees the sessions have created in the target repo
 	@set -a; . $(ENV); set +a; \
 	git -C "$$CLANKER_REPO" worktree list; \

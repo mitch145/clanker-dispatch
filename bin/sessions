@@ -28,12 +28,14 @@ case "${1:-list}" in
     #   ! blocked (wants you)   ▶ busy   ○ idle
     # Only live sessions are listed — this goes into a push notification, and
     # finished ones would push the interesting row off the screen.
+    # status is the live truth: `waiting` means sitting on a prompt right now;
+    # `state: blocked` latches after answered prompts and must be ignored.
     printf '%s' "$json" | jq -r '
       map(select(has("status"))) as $a
       | if ($a | length) == 0 then "nothing running"
         else
           ( $a
-            | map(. + {ph: (if .state == "blocked" then "blocked" else (.status // "idle") end)})
+            | map(. + {ph: (if .status == "waiting" then "blocked" else (.status // "idle") end)})
             | map(. + {rank: (if .ph == "blocked" then 0 elif .ph == "busy" then 1 else 2 end)})
             | sort_by(.rank, .name)
             | map(
@@ -42,10 +44,37 @@ case "${1:-list}" in
                 + (if .kind == "background" then "" else " (interactive)" end)
               ) | join("\n") )
           + "\n"
-          + (($a | map(select(.state == "blocked")) | length | tostring) + " blocked, "
+          + (($a | map(select(.status == "waiting")) | length | tostring) + " blocked, "
             + ($a | map(select(.status == "busy")) | length | tostring) + " busy, "
-            + ($a | map(select(.status != "busy" and .state != "blocked")) | length | tostring) + " idle")
+            + ($a | map(select(.status != "busy" and .status != "waiting")) | length | tostring) + " idle")
         end'
+    ;;
+  prune)
+    # Delete superseded background session RECORDS — the registration rows
+    # `claude agents --all` accumulates forever. Two rules:
+    #   - every `stopped` record goes: a stop is always a supersede or an
+    #     abort, and stopped rows carry no result summary worth keeping
+    #   - a `done` record goes when a NEWER record shares its name — the
+    #     newest holder of a name keeps its summary line, shadowed ones are
+    #     duplicate noise from fork-resumes
+    # Safe by construction: `claude rm` deletes the registration only — the
+    # transcript survives and --resume of a pruned session still works
+    # (verified) — and live or interactive sessions are never candidates.
+    json="$(timeout 25 "$CLAUDE_BIN" agents --json --all 2>/dev/null)"
+    [[ -n "$json" ]] || { echo "could not read agent list"; exit 1; }
+    n=0
+    while read -r sid; do
+      [[ -n "$sid" ]] || continue
+      timeout 25 "$CLAUDE_BIN" rm "${sid:0:8}" >/dev/null 2>&1 && n=$((n + 1))
+    done < <(printf '%s' "$json" | jq -r '
+      [.[] | select(type == "object") | select(.kind == "background")]
+      | group_by(.name // .sessionId)
+      | map( (max_by(.startedAt // 0)) as $keep
+             | .[]
+             | select(has("status") | not)
+             | select(.state == "stopped" or .sessionId != $keep.sessionId) )
+      | .[].sessionId // empty')
+    echo "pruned $n session record(s)"
     ;;
   stop)
     name="${2:-}"
@@ -61,5 +90,5 @@ case "${1:-list}" in
       && echo "stopped $name" || echo "could not stop $name"
     ;;
   *)
-    echo "usage: sessions [list|stop <name>]" >&2; exit 64 ;;
+    echo "usage: sessions [list|stop <name>|prune]" >&2; exit 64 ;;
 esac

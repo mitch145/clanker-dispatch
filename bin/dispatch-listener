@@ -169,11 +169,12 @@ while true; do
     case "${cmd:-}" in
       ping|ls|sessions) echo "control: $cmd"; notify "Sessions" "$("$SESSIONS" list)"; continue ;;
       stop)             echo "control: $cmd ${ticket:-}"; notify "Stop" "$("$SESSIONS" stop "${ticket:-}")"; continue ;;
+      prune)            echo "control: $cmd"; notify "Prune" "$("$SESSIONS" prune)"; continue ;;
     esac
     # Non-dispatch traffic is ignored, but say so in the journal — otherwise a
     # typo'd verb looks exactly like a dead listener from the phone's side.
     # Verb list mirrors bin/spawn; `status` is the one verb that takes no id.
-    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|resume|wake|new|session|stop)$ ]]; then
+    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|resume|wake|new|session|stop|prune)$ ]]; then
       echo "ignored (not a dispatch): $msg"
       continue
     fi
