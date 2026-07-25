@@ -128,13 +128,19 @@ def agents(force=False):
 # `claude agents --json` returns three differently-shaped records and the
 # difference is not documented anywhere, so it's pinned here:
 #
-#   interactive        pid, status(busy|idle), sometimes NO name
-#   background live    pid, id, status(busy|idle), state(blocked|running)
+#   interactive        pid, status(busy|idle|waiting), sometimes NO name
+#   background live    pid, id, status(busy|idle|waiting), state(blocked|running)
 #   background done    id, state(done|stopped), NO status, NO pid
 #
-# So `status` is absent exactly when the session has finished, which is what
-# makes it a reliable liveness test. Reading `status` alone (as this did at
-# first) reports a finished agent as idle and a blocked one as idle too.
+# `status` is absent exactly when the session has finished, which is what
+# makes it a reliable liveness test.
+#
+# For live sessions, `status` is the ONLY field to trust. `state: blocked`
+# LATCHES: it's set when a permission prompt opens and does not reliably
+# clear once the prompt is answered from the app — observed on agents that
+# worked for twenty minutes, and on one whose turn had finished, while state
+# still said blocked. The real "sitting on a prompt right now" signal is
+# status == "waiting" (verified against a session showing a live prompt).
 PHASE_ORDER = {"blocked": 0, "busy": 1, "idle": 2, "stopped": 3, "done": 4}
 
 
@@ -142,11 +148,10 @@ def phase(a):
     live = "status" in a
     if not live:
         return a.get("state") or "done"
-    # blocked outranks busy/idle: it means the agent is waiting on a human, and
-    # on a phone that's the only row you actually need to act on.
-    if a.get("state") == "blocked":
+    status = a.get("status") or "idle"
+    if status == "waiting":
         return "blocked"
-    return a.get("status") or "idle"
+    return status
 
 
 def normalise(a):
@@ -271,7 +276,7 @@ def pr_gates():
     q = ("query($q: String!) { search(query: $q, type: ISSUE, first: 40) {"
          " nodes { ... on PullRequest { number mergeable"
          " reviewThreads(first: 100) { nodes { isResolved } }"
-         " comments(last: 50) { nodes { author { login } body } } } } } }")
+         " comments(last: 50) { nodes { author { login } body updatedAt } } } } } }")
     try:
         out = subprocess.run(
             [gh, "api", "graphql", "-f", "query=" + q,
@@ -287,13 +292,17 @@ def pr_gates():
         num = n.get("number")
         if not num:
             continue
-        score, queued = None, False
+        score, score_at, queued = None, "", False
         for c in ((n.get("comments") or {}).get("nodes") or []):
             login = str((c.get("author") or {}).get("login") or "")
             body = c.get("body") or ""
             if login.startswith("greptile"):
                 m = GREPTILE_RE.search(body)
-                if m:
+                # Greptile sometimes EDITS an earlier summary comment on
+                # re-review instead of appending, so "latest score" means
+                # newest updatedAt, not last in thread order.
+                if m and str(c.get("updatedAt") or "") >= score_at:
+                    score_at = str(c.get("updatedAt") or "")
                     score = int(m.group(1))
             # graphite-app maintains one "Merge activity" comment, appending a
             # bullet per event (queued / removed / merged). The last bullet is
@@ -451,8 +460,7 @@ def board(force=False):
     for a in (agents() or []):
         nm = a.get("name") or ""
         live = "status" in a
-        ph = ("blocked" if a.get("state") == "blocked" else (a.get("status") or "idle")) \
-            if live else (a.get("state") or "done")
+        ph = phase(a)
         for num in set(re.findall(r"\d{4,6}", nm)):
             refs.setdefault(num, []).append({
                 "name": nm, "id": a.get("id") or (a.get("sessionId") or "")[:8],

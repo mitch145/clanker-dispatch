@@ -182,9 +182,8 @@ agents_all_json() { timeout 20 "$claude_bin" agents --json --all 2>/dev/null; }
 resume_pick() { # resume_pick <ticket> -> "sessionId<TAB>shortId<TAB>live|ended"
   agents_all_json | jq -r --arg t "$1" '
       [.[] | select(((.name // "") | test("^(ship|revise)-" + $t + "(-[0-9]+)?$"))
-                    and ((.state == "done" or .state == "stopped")
-                         or (.kind == "background" and .status == "idle"
-                             and .state != "blocked")))]
+                    and ((has("status") | not)
+                         or (.kind == "background" and .status == "idle")))]
       | max_by(.startedAt // 0)
       | if . == null then empty
         else [.sessionId // "", .id // "",
@@ -223,7 +222,10 @@ if [[ -n "$rec" ]]; then
     n=2
     while [[ -n "$(live_rec "$label-$n")" ]]; do n=$((n + 1)); done
     label="$label-$n"
-  elif [[ "$(jq -r '(.kind == "background") and (.status == "idle") and (.state != "blocked")' <<< "$rec")" == "true" ]]; then
+  elif [[ "$(jq -r '(.kind == "background") and (.status == "idle")' <<< "$rec")" == "true" ]]; then
+    # status is the live truth; state=blocked latches after answered prompts
+    # and must not protect a session whose turn is over. waiting (a real
+    # pending prompt) and busy both fall through to the hard skip below.
     reap_short="$(jq -r '.id // empty' <<< "$rec")"
     [[ -n "$reap_short" ]] && timeout 25 "$claude_bin" stop "$reap_short" >/dev/null 2>&1 || true
     echo "reaped idle session $label (turn was finished)" >&2
