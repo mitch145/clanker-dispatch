@@ -850,8 +850,11 @@
   refresh();
   refreshBoard();
   setInterval(refresh, 5000);
-  // PR state costs a gh round trip and moves in minutes, not seconds.
-  setInterval(refreshBoard, 60000);
+  // Poll the board nearly as fast as the fleet: the server only pays the gh
+  // round trip when its own 60s cache expires, but agent PHASES on the rows
+  // are recomputed per request — a slow poll here is why the board could say
+  // "in flight" a minute after Fleet showed the agent blocked.
+  setInterval(refreshBoard, 10000);
   // Phones freeze timers in a backgrounded tab; without this the list is stale
   // for however long it took you to walk back to it.
   document.addEventListener("visibilitychange", function () {

@@ -337,7 +337,10 @@ def next_action(pr, agent_phase):
     and 'something is already working on it' outranks every suggestion."""
     if agent_phase == "blocked":
         return None, "waiting on you", "blocked"
-    if agent_phase in ("busy", "idle"):
+    # busy only: an idle background agent has finished its turn, and letting
+    # it suppress the verdict leaves a row saying "in flight" while its own
+    # gate strip shows conflicts — the PR state is the truth again by then.
+    if agent_phase == "busy":
         return None, "agent in flight", "flight"
     if pr is None:
         return "implement", "no PR yet", "todo"
@@ -466,11 +469,16 @@ def board(force=False):
 
     def sessions_for(*nums):
         """Sessions referencing any of the given numbers: live first, then by
-        recency. Capped — a long-lived ticket accretes a lot of history."""
+        recency. Keyed by NAME, not id — a resumed fork shares its ancestor's
+        name, and listing "revise-5572" twice reads as a glitch; the live or
+        newest holder of the name represents it. Capped — a long-lived ticket
+        accretes a lot of history."""
         picked = {}
         for n in nums:
             for s in refs.get(str(n or ""), []):
-                picked[s["id"]] = s
+                cur = picked.get(s["name"])
+                if cur is None or (s["live"], s["startedAt"]) > (cur["live"], cur["startedAt"]):
+                    picked[s["name"]] = s
         ordered = sorted(picked.values(),
                          key=lambda s: (not s["live"], -s["startedAt"]))[:6]
         return [{k: s[k] for k in ("name", "id", "phase", "live")} for s in ordered]
