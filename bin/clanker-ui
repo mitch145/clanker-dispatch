@@ -33,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 UI_DIR = HERE.parent / "ui"
 SPAWN = HERE / "spawn"
 SESSIONS = HERE / "sessions"
+MERGE = HERE / "merge-queue"
 
 # The env file is sourced by the systemd unit via EnvironmentFile, but this also
 # runs by hand (`make ui-fg`) where nothing has loaded it. Parse it ourselves so
@@ -228,6 +229,7 @@ def session_detail(short):
 # want on a train is "SLATE-5507's checks are failing" — a session list can
 # never tell you that, because the session ended an hour ago.
 GH_REPO = os.environ.get("CLANKER_GH_REPO", "slate-technologies/slate")
+TRUNK = os.environ.get("CLANKER_TRUNK", "main")
 TICKET_RE = re.compile(r"SLATE-(\d{1,6})", re.I)
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "clanker"
 
@@ -244,7 +246,8 @@ def gh_prs():
         out = subprocess.run(
             [gh, "pr", "list", "--repo", GH_REPO, "--author", "@me", "--state", "open",
              "--limit", "40", "--json",
-             "number,title,isDraft,reviewDecision,updatedAt,url,statusCheckRollup"],
+             "number,title,isDraft,reviewDecision,updatedAt,url,statusCheckRollup,"
+             "baseRefName,headRefName"],
             capture_output=True, text=True, timeout=60,
         ).stdout
         return json.loads(out) if out.strip() else []
@@ -340,6 +343,12 @@ def next_action(pr, agent_phase):
     if rd == "APPROVED":
         if pending:
             return None, "approved · %d check%s running" % (pending, "" if pending == 1 else "s"), "flight"
+        # Graphite's mergeability is not GitHub's: only the bottom of a stack
+        # can be queued, and `gt merge` would drag unmerged parents along.
+        # A stacked PR that's otherwise green is waiting on its downstack.
+        if pr.get("baseRefName") and pr.get("baseRefName") != TRUNK:
+            p = pr.get("_parent")
+            return None, "approved · stacked%s" % (" after #%s" % p if p else ""), "flight"
         return None, "approved · ready to merge", "good"
     # Cooking outranks draft: "go finish the draft" is wrong advice while its
     # checks are still running — wait for them, then decide.
@@ -392,19 +401,51 @@ def board(force=False):
             _board["data"] = prs
         cached = prs
 
+    # Stack position: a PR whose base is another PR's head is stacked on it.
+    # Needed because Graphite will only queue the bottom of a stack.
+    head_to_num = {p.get("headRefName"): p.get("number") for p in (cached or [])}
+    for pr in (cached or []):
+        pr["_parent"] = head_to_num.get(pr.get("baseRefName"))
+
     # Live agent phase per ticket. spawn labels sessions <action>-<ticket>, so
     # the ticket is recoverable from the name without another lookup.
-    phase_by_ticket = {}
+    #
+    # Separately, collect every session whose NAME mentions a ticket or PR
+    # number at all — an epic session that created the ticket, a specialised
+    # reviser, an interactive one named "SLATE-5388". Those don't drive the
+    # verdict (only the verb-<ticket> convention does), but they belong on the
+    # ticket's row: "who has touched this" is exactly the question when a
+    # ticket has history.
+    phase_by_ticket, refs = {}, {}
     for a in (agents() or []):
-        m = re.match(r"^[a-z]+-(\d{1,6})(?:-\d+)?$", a.get("name") or "")
-        if not m or "status" not in a:
+        nm = a.get("name") or ""
+        live = "status" in a
+        ph = ("blocked" if a.get("state") == "blocked" else (a.get("status") or "idle")) \
+            if live else (a.get("state") or "done")
+        for num in set(re.findall(r"\d{4,6}", nm)):
+            refs.setdefault(num, []).append({
+                "name": nm, "id": a.get("id") or (a.get("sessionId") or "")[:8],
+                "phase": ph, "live": live, "startedAt": a.get("startedAt") or 0,
+            })
+        m = re.match(r"^[a-z]+-(\d{1,6})(?:-\d+)?$", nm)
+        if not m or not live:
             continue
-        ph = "blocked" if a.get("state") == "blocked" else (a.get("status") or "idle")
         # blocked beats busy beats idle if a ticket somehow has two sessions
         rank = {"blocked": 0, "busy": 1, "idle": 2}
         cur = phase_by_ticket.get(m.group(1))
         if cur is None or rank.get(ph, 9) < rank.get(cur, 9):
             phase_by_ticket[m.group(1)] = ph
+
+    def sessions_for(*nums):
+        """Sessions referencing any of the given numbers: live first, then by
+        recency. Capped — a long-lived ticket accretes a lot of history."""
+        picked = {}
+        for n in nums:
+            for s in refs.get(str(n or ""), []):
+                picked[s["id"]] = s
+        ordered = sorted(picked.values(),
+                         key=lambda s: (not s["live"], -s["startedAt"]))[:6]
+        return [{k: s[k] for k in ("name", "id", "phase", "live")} for s in ordered]
 
     rows, seen = [], set()
     for pr in (cached or []):
@@ -424,6 +465,9 @@ def board(force=False):
             "review": pr.get("reviewDecision") or "",
             "failed": failed, "pending": pending, "checks": total,
             "greptile": pr.get("_greptile"), "conflicts": pr.get("_conflicts", False),
+            "parent": pr.get("_parent"),
+            "ready": why == "approved · ready to merge",
+            "sessions": sessions_for(ticket, pr.get("number")),
             "phase": ph, "next": verb, "why": why, "tone": tone,
             "updatedAt": pr.get("updatedAt") or "",
         })
@@ -437,7 +481,8 @@ def board(force=False):
         rows.append({
             "ticket": ticket, "pr": None, "url": None, "title": "",
             "draft": False, "review": "", "failed": 0, "pending": 0, "checks": 0,
-            "greptile": None, "conflicts": False,
+            "greptile": None, "conflicts": False, "parent": None, "ready": False,
+            "sessions": sessions_for(ticket),
             "phase": ph, "next": verb, "why": why, "tone": tone, "updatedAt": "",
         })
 
@@ -592,6 +637,28 @@ class Handler(BaseHTTPRequestHandler):
             _cache["at"] = 0.0  # next poll shows the new agent, not a stale list
             msg = {0: "started", 3: "already running"}.get(rc, f"failed (exit {rc})")
             return self.send_json({"ok": rc in (0, 3), "rc": rc, "message": msg, "detail": out})
+
+        if path == "/api/merge":
+            # Graphite merge queue, not `gh pr merge`: mid-stack PRs must not
+            # be mergeable and children must get restacked by the queue.
+            # merge-queue re-validates against GitHub server-side, and
+            # `gt merge` runs Graphite's own mergeability check on top — the
+            # page's `ready` flag is a convenience, not the gate.
+            try:
+                pr = int(body.get("pr", 0))
+            except (TypeError, ValueError):
+                pr = 0
+            if not (0 < pr < 10**6):
+                return self.send_json({"ok": False, "message": "bad pr number"}, 400)
+            rc, out = run([str(MERGE), str(pr)], timeout=300)
+            with _board_lock:
+                _board["at"] = 0.0  # next board poll sees the queued state
+            # Last lines carry gt's verdict; the whole log would drown a toast.
+            # gt colours everything, and escape codes in a toast read as noise.
+            tail = "\n".join(ANSI_ESC.sub("", ANSI_CSI.sub("", out)).splitlines()[-4:])
+            return self.send_json({"ok": rc == 0,
+                                   "message": "queued" if rc == 0 else "merge failed",
+                                   "detail": tail})
 
         if path == "/api/stop":
             name = str(body.get("name", "")).strip()

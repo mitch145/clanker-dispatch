@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# merge-queue <pr-number> [--dry-run]
+#
+# Queue a PR into Graphite's merge queue via `gt merge`. Used by clanker-ui's
+# Merge button; runs by hand over ssh just as well.
+#
+# gt's working-tree commands (submit, merge) resolve the repo root to the git
+# common dir, and in the real checkout that's a bare repo (.bare + worktrees)
+# — `git status` there fails and gt dies with it, from any cwd. So gt gets a
+# dedicated plain clone instead, blobless to keep it cheap, bootstrapped on
+# first use and reused after. Nothing here touches the real checkout.
+#
+# `gt merge --dry-run` runs Graphite's OWN mergeability validation (stack
+# position, queue state) — which is not GitHub's. The cheap GitHub checks
+# below exist only to fail fast with a readable reason before paying for the
+# clone dance.
+set -euo pipefail
+
+ENV_FILE="${CLANKER_ENV:-$HOME/.config/clanker/env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+GH_REPO="${CLANKER_GH_REPO:-slate-technologies/slate}"
+TRUNK="${CLANKER_TRUNK:-main}"
+CLONE="${CLANKER_GT_CLONE:-${XDG_STATE_HOME:-$HOME/.local/state}/clanker/gt-clone}"
+
+pr="${1:?usage: merge-queue <pr-number> [--dry-run]}"
+[[ "$pr" =~ ^[0-9]{1,6}$ ]] || { echo "bad pr number: $pr" >&2; exit 64; }
+dry=""
+[[ "${2:-}" == "--dry-run" ]] && dry="--dry-run"
+
+for dep in gh gt jq; do
+  command -v "$dep" >/dev/null || { echo "missing dependency: $dep" >&2; exit 1; }
+done
+
+# Fail fast on the GitHub-visible reasons before the clone dance. Bottom of
+# stack only: `gt merge` queues trunk..branch, so a mid-stack PR would drag
+# its unmerged parents into the queue with it.
+info="$(gh pr view "$pr" --repo "$GH_REPO" --json state,isDraft,baseRefName,headRefName)"
+state="$(jq -r .state <<< "$info")"
+draft="$(jq -r .isDraft <<< "$info")"
+base="$(jq -r .baseRefName <<< "$info")"
+head="$(jq -r .headRefName <<< "$info")"
+[[ "$state" == "OPEN" ]] || { echo "PR #$pr is $state, not open" >&2; exit 65; }
+[[ "$draft" == "false" ]] || { echo "PR #$pr is a draft" >&2; exit 65; }
+[[ "$base" == "$TRUNK" ]] || {
+  echo "PR #$pr is stacked on $base — merge from the bottom of the stack" >&2
+  exit 65
+}
+
+if [[ ! -d "$CLONE/.git" ]]; then
+  mkdir -p "$(dirname "$CLONE")"
+  git clone --filter=blob:none "git@github.com:$GH_REPO.git" "$CLONE"
+  (cd "$CLONE" && gt init --trunk "$TRUNK")
+fi
+
+cd "$CLONE"
+git fetch origin "$TRUNK" "$head"
+# Local branches must equal remote exactly: gt merge prompts (and in
+# non-interactive mode aborts) when they differ.
+git checkout -q -B "$head" "origin/$head"
+git branch -f "$TRUNK" "origin/$TRUNK"
+gt track --parent "$TRUNK" >/dev/null 2>&1 || true
+
+# gt refuses branches it hasn't submitted itself ("no associated PRs"), even
+# when the PR exists — the association lives in Graphite's metadata, not
+# GitHub's. `gt submit --update-only` adopts the existing PR: it cannot create
+# PRs, --no-edit keeps title/body untouched, and the branch just got reset to
+# origin so there is nothing to push. One-time per branch, then merge again.
+out=""
+if out="$(gt merge ${dry:+$dry} --no-interactive 2>&1)"; then
+  echo "$out"
+elif grep -q "do not have associated PRs" <<< "$out"; then
+  gt submit --update-only --no-edit --quiet --no-interactive
+  gt merge ${dry:+$dry} --no-interactive 2>&1
+else
+  echo "$out"
+  exit 1
+fi

@@ -146,6 +146,10 @@
   .g.good { color: var(--calm); border-color: color-mix(in srgb, var(--calm) 45%, var(--rule)); }
   .g.bad { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, var(--rule)); }
   .g.amber { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--rule)); }
+  .brsess { margin: 4px 0 2px 18px; }
+  .brs { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 2px 0; }
+  .brsn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .brsp { margin-left: auto; flex: none; font-family: var(--mono); font-size: 11px; color: var(--faint); }
   .why { margin-left: auto; font-size: 12px; color: var(--dim); font-family: var(--mono);
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 48%; text-align: right; }
   .why.bad, .why.blocked { color: var(--alert); }
@@ -382,6 +386,22 @@
       });
   }
 
+  function mergePR(pr) {
+    // The merge takes as long as gt takes — first run bootstraps a clone.
+    toast("queueing #" + pr + " …", "mut");
+    return fetch("/api/merge", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pr: Number(pr) })
+    }).then(function (r) { return r.json(); })
+      .then(function (d) {
+        toast("#" + pr + " · " + (d.message || "?"), d.ok ? "good" : "bad");
+        pushLog({ ts: stamp(), txt: "merge #" + pr, kind: "mut" });
+        pushLog({ ts: stamp(), txt: "→ " + (d.detail || d.message || ""), kind: d.ok ? "ok" : "warn" });
+        refreshBoard(true);
+        return d.ok;
+      });
+  }
+
   function stopAgent(name) {
     if (!confirm("Stop " + name + "?")) return;
     fetch("/api/stop", {
@@ -489,8 +509,21 @@
     b.push(r.review === "APPROVED" ? ["good", "appr ✓"]
          : r.review === "CHANGES_REQUESTED" ? ["bad", "changes ✗"]
          : ["", "rev —"]);
+    if (r.parent) b.push(["", "on #" + r.parent]);
     return '<div class="gates">' + b.map(function (x) {
       return '<span class="g ' + x[0] + '">' + x[1] + "</span>";
+    }).join("") + "</div>";
+  }
+
+  // Sessions that reference this ticket/PR by name — the epic that spawned
+  // it, the reviser that fixed it — shown inside the expanded row.
+  var SESS_TONE = { blocked: "blocked", busy: "good", idle: "todo" };
+  function sessList(r) {
+    if (!r.sessions || !r.sessions.length) return "";
+    return '<div class="brsess">' + r.sessions.map(function (s) {
+      return '<div class="brs"><span class="tone ' + (s.live ? (SESS_TONE[s.phase] || "") : "") + '"></span>' +
+             '<span class="mono brsn">' + esc(s.name) + '</span>' +
+             '<span class="brsp">' + esc(s.phase) + "</span></div>";
     }).join("") + "</div>";
   }
 
@@ -515,7 +548,11 @@
              (r.title ? '<div class="btitle">' + esc(r.title) + "</div>" : "") +
            "</div>";
       if (open) {
+        h += sessList(r);
         h += '<div class="bacts">';
+        if (r.ready && r.pr) {
+          h += '<button class="btn primary" data-merge="' + r.pr + '">merge #' + r.pr + "</button>";
+        }
         ["implement", "continue", "review"].forEach(function (v) {
           var pick = v === r.next;
           h += '<button class="btn' + (pick ? " primary" : "") + '" data-go="' + v + ":" + esc(r.ticket || "") +
@@ -531,6 +568,9 @@
         h += '<div class="bacts"><button class="btn primary" data-go="' + r.next + ":" + esc(r.ticket) +
              '">' + SHORT[r.next] + " " + esc(r.ticket) + "</button>" +
              '<span class="bhint">tap the row for other verbs</span></div>';
+      } else if (r.ready && r.pr) {
+        h += '<div class="bacts"><button class="btn primary" data-merge="' + r.pr + '">merge #' + r.pr +
+             "</button><span class=\"bhint\">via Graphite queue</span></div>";
       }
     });
     return h + '<div style="height:14px"></div>';
@@ -634,8 +674,12 @@
   });
 
   main.addEventListener("click", function (e) {
-    var t = e.target.closest("[data-stop],[data-rd],[data-row],[data-open],[data-cmd],[data-go],[data-tk],#hero");
+    var t = e.target.closest("[data-stop],[data-rd],[data-row],[data-open],[data-cmd],[data-go],[data-tk],[data-merge],#hero");
     if (!t) return;
+    if (t.dataset.merge) {
+      if (!confirm("Queue #" + t.dataset.merge + " into the Graphite merge queue?")) return;
+      return mergePR(t.dataset.merge);
+    }
     if (t.dataset.go) {
       var g = t.dataset.go.split(":");
       openTicket = null;

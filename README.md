@@ -190,6 +190,16 @@ hands off the keystroke.
   taking a ticket number and an optional description. `spawn` still understands
   `plan`/`style`/`cleanup`/`status` from ntfy; they're just not on a screen you
   scan one-handed.
+- **Merge** on a ready row queues the PR into Graphite's merge queue
+  (`bin/merge-queue`). Runs `gt` in a dedicated plain clone under
+  `~/.local/state/clanker/gt-clone` — gt's working-tree commands die against
+  the bare+worktrees checkout — and only for bottom-of-stack PRs. The page's
+  `ready` flag is a convenience; `gt merge`'s own validation is the gate, so
+  Graphite-side blockers (unresolved comments, queue state) come back in the
+  toast verbatim.
+- Expanded board rows list every session whose *name* references the ticket
+  or PR number — the epic that spawned it, the reviser that fixed it — live
+  ones first.
 - Verb list comes from the server, so changing `VERBS` in `bin/clanker-ui`
   doesn't mean hand-editing the page.
 - The page is re-read from disk per request. Edit `ui/index.html`, pull to
