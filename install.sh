@@ -26,6 +26,19 @@ for f in bin/*; do
 done
 echo ">> Symlinked $(ls bin | tr '\n' ' ')into ~/.local/bin"
 
+# Skills: any Claude session on this box can dispatch agents when — and only
+# when — explicitly asked. Symlinked like bin/, so the repo stays the source
+# of truth. rm first: `ln -sf` onto an existing dir symlink nests instead of
+# replacing.
+mkdir -p "$HOME/.claude/skills"
+for d in skills/*/; do
+  [[ -d "$d" ]] || continue
+  tgt="$HOME/.claude/skills/$(basename "$d")"
+  [[ -L "$tgt" ]] && rm -f "$tgt"
+  ln -s "$(readlink -f "$d")" "$tgt"
+done
+echo ">> Symlinked $(ls skills | tr '\n' ' ')into ~/.claude/skills"
+
 # The UI refuses to start without a token. Mint one on first install rather
 # than leaving a REPLACE_ME that only announces itself as a failed unit later.
 if ! grep -q '^CLANKER_UI_TOKEN=' "$HOME/.config/clanker/env" \
