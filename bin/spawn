@@ -170,13 +170,26 @@ agents_all_json() { timeout 20 "$claude_bin" agents --json --all 2>/dev/null; }
 # implementer's session already holds the design decisions, the review thread,
 # and the reasons things are the way they are. Resume that session — forked,
 # so the original transcript stays intact and the revise gets its own id under
-# its own label — instead of starting cold. Only finished sessions are
-# candidates: resuming a live one would race the agent still driving it.
-prior_session() { # prior_session <ticket> -> session id or empty
+# its own label — instead of starting cold.
+#
+# "Finished" has a shade the first cut missed: a background agent that ended
+# its turn stays registered as live-but-idle indefinitely. That session is
+# done in every way that matters — and it holds the warmest head — but it is
+# neither resumable (live) nor skippable (it made the guard refuse the very
+# dispatch the board suggests). So idle background sessions are candidates
+# too; the caller stops one before forking so the fork is the only writer.
+# busy and blocked stay off limits: those agents are still driving.
+resume_pick() { # resume_pick <ticket> -> "sessionId<TAB>shortId<TAB>live|ended"
   agents_all_json | jq -r --arg t "$1" '
-      [.[] | select((.state == "done" or .state == "stopped")
-                    and ((.name // "") | test("^(ship|revise)-" + $t + "(-[0-9]+)?$")))]
-      | (max_by(.startedAt // 0) | .sessionId) // empty' 2>/dev/null
+      [.[] | select(((.name // "") | test("^(ship|revise)-" + $t + "(-[0-9]+)?$"))
+                    and ((.state == "done" or .state == "stopped")
+                         or (.kind == "background" and .status == "idle"
+                             and .state != "blocked")))]
+      | max_by(.startedAt // 0)
+      | if . == null then empty
+        else [.sessionId // "", .id // "",
+              (if has("status") then "live" else "ended" end)] | @tsv
+        end' 2>/dev/null
 }
 
 # Is a session with this name alive right now? `claude agents --json` is the
@@ -190,19 +203,34 @@ agent_alive() {
 # listener replays `since=10m` on restart, so a redelivered message must not
 # spawn a second session. Deliberately a hard skip, not a -2 suffix: the
 # listener is the reason this exists, and silent double-spawn is the worse bug.
-# Only a *live* session blocks a re-dispatch. A finished agent leaves its name
-# free, so re-running completed work just works instead of reporting "Already
-# up" about something that ended half an hour ago.
-if agent_alive "$label"; then
-  if [[ "$dedupe" == skip ]]; then
+#
+# "Live" has shades, though. blocked and busy mean an agent is genuinely
+# driving — those skip. But a *background* agent that finished its turn stays
+# registered as live-but-idle indefinitely, and treating that as occupied
+# made spawn refuse the exact dispatch the board suggests for a ticket whose
+# reviser finished an hour ago. Idle background sessions get reaped here:
+# stopped, name freed, and (for revise) their head becomes the resume
+# candidate. Interactive sessions are never reaped — idle there means a
+# human between keystrokes.
+live_rec() { agents_json | jq -c --arg n "$1" '[.[] | select(.name == $n)] | first // empty' 2>/dev/null; }
+
+rec="$(live_rec "$label")"
+if [[ -n "$rec" ]]; then
+  if [[ "$dedupe" == suffix ]]; then
+    # `new` is a blank session, not a claim on a work item — running two is
+    # legitimate, and an idle one may be a human mid-thought in the app.
+    # Suffix is -N, never .N, to stay tmux-target-safe if attached.
+    n=2
+    while [[ -n "$(live_rec "$label-$n")" ]]; do n=$((n + 1)); done
+    label="$label-$n"
+  elif [[ "$(jq -r '(.kind == "background") and (.status == "idle") and (.state != "blocked")' <<< "$rec")" == "true" ]]; then
+    reap_short="$(jq -r '.id // empty' <<< "$rec")"
+    [[ -n "$reap_short" ]] && timeout 25 "$claude_bin" stop "$reap_short" >/dev/null 2>&1 || true
+    echo "reaped idle session $label (turn was finished)" >&2
+  else
     echo "session $label is already running; skipping" >&2
     exit "$EX_SKIP"
   fi
-  # `new` is a blank session, not a claim on a work item — running two is
-  # legitimate. Suffix is -N, never .N, to stay tmux-target-safe if attached.
-  n=2
-  while agent_alive "$label-$n"; do n=$((n + 1)); done
-  label="$label-$n"
 fi
 
 # Name the session twice over, both matching the tmux window:
@@ -220,7 +248,12 @@ fi
 args=(-n "$label" --remote-control="$label" --bg)
 resume_sid=""
 if [[ "$act" == revise && -n "${raw:-}" ]]; then
-  resume_sid="$(prior_session "$raw")"
+  resume_live=""
+  IFS=$'\t' read -r resume_sid resume_short resume_live < <(resume_pick "$raw") || true
+  if [[ "$resume_live" == "live" && -n "${resume_short:-}" ]]; then
+    # Finished turn, still registered: stop it so the fork is the only writer.
+    timeout 25 "$claude_bin" stop "$resume_short" >/dev/null 2>&1 || true
+  fi
   [[ -n "$resume_sid" ]] && args=(--resume "$resume_sid" --fork-session "${args[@]}")
 fi
 [[ -n "$PERM_MODE" ]] && args+=(--permission-mode "$PERM_MODE")
