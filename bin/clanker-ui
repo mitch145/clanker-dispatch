@@ -287,14 +287,23 @@ def pr_gates():
         num = n.get("number")
         if not num:
             continue
-        score = None
+        score, queued = None, False
         for c in ((n.get("comments") or {}).get("nodes") or []):
             login = str((c.get("author") or {}).get("login") or "")
-            if not login.startswith("greptile"):
-                continue
-            m = GREPTILE_RE.search(c.get("body") or "")
-            if m:
-                score = int(m.group(1))
+            body = c.get("body") or ""
+            if login.startswith("greptile"):
+                m = GREPTILE_RE.search(body)
+                if m:
+                    score = int(m.group(1))
+            # graphite-app maintains one "Merge activity" comment, appending a
+            # bullet per event (queued / removed / merged). The last bullet is
+            # the current state: in the queue iff it's an "added ... to the
+            # merge queue" line. Merged PRs never show here — open PRs only.
+            elif login.startswith("graphite") and "Merge activity" in body:
+                bullets = [ln for ln in body.splitlines() if ln.lstrip().startswith("*")]
+                if bullets:
+                    queued = ("merge queue" in bullets[-1]
+                              and "added this pull request" in bullets[-1])
         threads = ((n.get("reviewThreads") or {}).get("nodes")) or []
         gates[num] = {
             "greptile": score,
@@ -304,6 +313,7 @@ def pr_gates():
             # Unresolved review threads: this is the state Graphite reads for
             # its "Unresolved comments" merge blocker, straight from GitHub.
             "unresolved": sum(1 for t in threads if not t.get("isResolved")),
+            "queued": queued,
         }
     return gates
 
@@ -331,6 +341,11 @@ def next_action(pr, agent_phase):
         return None, "agent in flight", "flight"
     if pr is None:
         return "implement", "no PR yet", "todo"
+    # Queue membership outranks every gate below: Graphite owns the PR now,
+    # runs its own validation at the queue head, and a revise dispatched at a
+    # queued PR would push over the very commit being merged.
+    if pr.get("_queued"):
+        return None, "in merge queue", "flight"
     failed, pending, total = check_summary(pr)
     # The revise gates, worst first. Conflicts outrank checks: red CI on a
     # conflicted branch is often the conflict's fault, and the fix is the same
@@ -408,6 +423,7 @@ def board(force=False):
                 pr["_greptile"] = g.get("greptile")
                 pr["_conflicts"] = bool(g.get("conflicts"))
                 pr["_unresolved"] = int(g.get("unresolved") or 0)
+                pr["_queued"] = bool(g.get("queued"))
         with _board_lock:
             _board["at"] = now
             _board["data"] = prs
@@ -478,6 +494,7 @@ def board(force=False):
             "failed": failed, "pending": pending, "checks": total,
             "greptile": pr.get("_greptile"), "conflicts": pr.get("_conflicts", False),
             "unresolved": int(pr.get("_unresolved") or 0),
+            "queued": bool(pr.get("_queued")),
             "parent": pr.get("_parent"),
             "ready": why == "approved · ready to merge",
             "sessions": sessions_for(ticket, pr.get("number")),
@@ -495,7 +512,7 @@ def board(force=False):
             "ticket": ticket, "pr": None, "url": None, "title": "",
             "draft": False, "review": "", "failed": 0, "pending": 0, "checks": 0,
             "greptile": None, "conflicts": False, "unresolved": 0,
-            "parent": None, "ready": False,
+            "queued": False, "parent": None, "ready": False,
             "sessions": sessions_for(ticket),
             "phase": ph, "next": verb, "why": why, "tone": tone, "updatedAt": "",
         })

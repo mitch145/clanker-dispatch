@@ -146,6 +146,8 @@
   .g.good { color: var(--calm); border-color: color-mix(in srgb, var(--calm) 45%, var(--rule)); }
   .g.bad { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, var(--rule)); }
   .g.amber { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--rule)); }
+  .btn.busy { pointer-events: none; animation: actpulse 1.1s ease-in-out infinite; }
+  @keyframes actpulse { 50% { opacity: .35; } }
   .brsess { margin: 4px 0 2px 18px; }
   .brs { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 2px 0; }
   .brsn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -373,6 +375,7 @@
       toast("needs a ticket number", "bad");
       return Promise.resolve(false);
     }
+    toast(SHORT[verb] + " " + (num || "") + " …", "mut");
     return fetch("/api/dispatch", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ verb: verb, id: num || "", extra: extra || "" })
@@ -403,12 +406,29 @@
   }
 
   function stopAgent(name) {
-    if (!confirm("Stop " + name + "?")) return;
-    fetch("/api/stop", {
+    if (!confirm("Stop " + name + "?")) return Promise.resolve(false);
+    return fetch("/api/stop", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name })
     }).then(function (r) { return r.json(); })
-      .then(function (d) { toast(d.message || "stopped", d.ok ? "good" : "bad"); refresh(true); });
+      .then(function (d) { toast(d.message || "stopped", d.ok ? "good" : "bad"); refresh(true); return d.ok; });
+  }
+
+  /* Instant feedback: every action button flips to a pulsing "working" state
+     the moment it's tapped and stays that way across background re-renders,
+     because the truth lives here and not in the DOM the poll rebuilds. */
+  var pendingAct = {};
+  function actWrap(key, promise) {
+    pendingAct[key] = true;
+    render();
+    function done() { delete pendingAct[key]; render(); }
+    return promise.then(function (v) { done(); return v; },
+                        function (e) { done(); throw e; });
+  }
+  function actBtn(key, cls, data, label, busyLabel) {
+    var b = pendingAct[key];
+    return '<button class="btn ' + cls + (b ? " busy" : "") + '" ' + data +
+           (b ? " disabled" : "") + ">" + (b ? busyLabel : label) + "</button>";
   }
 
   /* ---------------- pieces --------------------------------------------- */
@@ -446,7 +466,7 @@
                '<span class="card-age mono">' + age(a.startedAt) + "</span></div>" +
              detailBlock(a) +
              '<div class="acts">' + openInClaude(a) +
-               '<button class="btn danger" data-stop="' + esc(a.name) + '">Stop</button></div>' +
+               actBtn("s" + a.name, "danger", 'data-stop="' + esc(a.name) + '"', "Stop", "stopping…") + '</div>' +
            "</div>";
     });
 
@@ -464,7 +484,7 @@
           h += '<div style="padding:0 4px 10px">' + detailBlock(a) +
                (a.kind === "background"
                  ? '<div class="rd">' + openInClaude(a) +
-                   '<button class="btn danger" data-stop="' + esc(a.name) + '">Stop</button></div>'
+                   actBtn("s" + a.name, "danger", 'data-stop="' + esc(a.name) + '"', "Stop", "stopping…") + '</div>'
                  : "") +
                "</div>";
         }
@@ -507,6 +527,7 @@
     b.push(r.greptile == null ? ["", "G —"]
          : [r.greptile === 5 ? "good" : "bad", "G " + r.greptile + "/5"]);
     if (r.unresolved) b.push(["bad", "cmt " + r.unresolved]);
+    if (r.queued) b.push(["good", "in queue"]);
     b.push(r.review === "APPROVED" ? ["good", "appr ✓"]
          : r.review === "CHANGES_REQUESTED" ? ["bad", "changes ✗"]
          : ["", "rev —"]);
@@ -539,9 +560,10 @@
     // every PR needs a cslc — collapses to one button when 2+ rows want one.
     var wanting = brd.rows.filter(function (r) { return r.next === "continue" && r.ticket; });
     if (wanting.length >= 2) {
-      h += '<div class="bacts" style="margin-top:10px"><button class="btn primary" data-goall="' +
-           wanting.map(function (r) { return r.ticket; }).join(",") +
-           '">cslc all ' + wanting.length + " flagged</button></div>";
+      h += '<div class="bacts" style="margin-top:10px">' +
+           actBtn("all", "primary",
+                  'data-goall="' + wanting.map(function (r) { return r.ticket; }).join(",") + '"',
+                  "cslc all " + wanting.length + " flagged", "dispatching…") + "</div>";
     }
     brd.rows.forEach(function (r) {
       var t = r.ticket || String(r.pr);
@@ -560,12 +582,18 @@
         h += sessList(r);
         h += '<div class="bacts">';
         if (r.ready && r.pr) {
-          h += '<button class="btn primary" data-merge="' + r.pr + '">merge #' + r.pr + "</button>";
+          h += actBtn("m" + r.pr, "primary", 'data-merge="' + r.pr + '"',
+                      "merge #" + r.pr, "queueing…");
         }
         ["implement", "continue", "review"].forEach(function (v) {
           var pick = v === r.next;
-          h += '<button class="btn' + (pick ? " primary" : "") + '" data-go="' + v + ":" + esc(r.ticket || "") +
-               '"' + (r.ticket ? "" : " disabled") + ">" + SHORT[v] + " " + esc(r.ticket || "") + "</button>";
+          if (!r.ticket) {
+            h += '<button class="btn" disabled>' + SHORT[v] + "</button>";
+            return;
+          }
+          h += actBtn("g" + v + r.ticket, pick ? "primary" : "",
+                      'data-go="' + v + ":" + esc(r.ticket) + '"',
+                      SHORT[v] + " " + esc(r.ticket), SHORT[v] + " …");
         });
         if (r.url) h += '<a class="btn" href="' + esc(r.url) + '" target="_blank" rel="noopener">GitHub</a>';
         if (r.pr && brd.repo) {
@@ -574,12 +602,16 @@
         }
         h += "</div>";
       } else if (r.next && r.ticket) {
-        h += '<div class="bacts"><button class="btn primary" data-go="' + r.next + ":" + esc(r.ticket) +
-             '">' + SHORT[r.next] + " " + esc(r.ticket) + "</button>" +
+        h += '<div class="bacts">' +
+             actBtn("g" + r.next + r.ticket, "primary",
+                    'data-go="' + r.next + ":" + esc(r.ticket) + '"',
+                    SHORT[r.next] + " " + esc(r.ticket), SHORT[r.next] + " …") +
              '<span class="bhint">tap the row for other verbs</span></div>';
       } else if (r.ready && r.pr) {
-        h += '<div class="bacts"><button class="btn primary" data-merge="' + r.pr + '">merge #' + r.pr +
-             "</button><span class=\"bhint\">via Graphite queue</span></div>";
+        h += '<div class="bacts">' +
+             actBtn("m" + r.pr, "primary", 'data-merge="' + r.pr + '"',
+                    "merge #" + r.pr, "queueing…") +
+             '<span class="bhint">via Graphite queue</span></div>';
       }
     });
     return h + '<div style="height:14px"></div>';
@@ -628,7 +660,8 @@
         '<input id="dnum" inputmode="numeric" pattern="[0-9]*" placeholder="0000" ' +
                'aria-label="ticket number"' + (needsId ? "" : " disabled") + ">" +
         '<input id="dtxt" placeholder="optional description" aria-label="description" autocomplete="off">' +
-        '<button class="btn primary" id="dgo">Go</button>' +
+        '<button class="btn primary' + (pendingAct.dock ? " busy" : "") + '" id="dgo">' +
+          (pendingAct.dock ? "…" : "Go") + "</button>" +
       "</div></div>";
   }
 
@@ -686,29 +719,31 @@
     var t = e.target.closest("[data-stop],[data-rd],[data-row],[data-open],[data-cmd],[data-go],[data-tk],[data-merge],[data-goall],#hero");
     if (!t) return;
     if (t.dataset.merge) {
-      if (!confirm("Queue #" + t.dataset.merge + " into the Graphite merge queue?")) return;
-      return mergePR(t.dataset.merge);
+      var mp = t.dataset.merge;
+      if (!confirm("Queue #" + mp + " into the Graphite merge queue?")) return;
+      return actWrap("m" + mp, mergePR(mp));
     }
     if (t.dataset.goall) {
       var ts = t.dataset.goall.split(",");
       if (!confirm("Dispatch cslc against " + ts.length + " tickets: " + ts.join(", ") + "?")) return;
       // Sequential, not parallel: each spawn shells out to `claude` and gh,
       // and a burst of six at once serialises badly anyway.
-      return ts.reduce(function (p, tk) {
+      return actWrap("all", ts.reduce(function (p, tk) {
         return p.then(function () { return dispatch("continue", tk, ""); });
-      }, Promise.resolve()).then(function () { refreshBoard(true); });
+      }, Promise.resolve()).then(function () { refreshBoard(true); }));
     }
     if (t.dataset.go) {
       var g = t.dataset.go.split(":");
       openTicket = null;
-      return dispatch(g[0], g[1], "").then(function () { refreshBoard(true); });
+      return actWrap("g" + g[0] + g[1],
+                     dispatch(g[0], g[1], "").then(function () { refreshBoard(true); }));
     }
     if (t.dataset.tk) { openTicket = openTicket === t.dataset.tk ? null : t.dataset.tk; return render(); }
-    if (t.dataset.stop) return stopAgent(t.dataset.stop);
+    if (t.dataset.stop) return actWrap("s" + t.dataset.stop, stopAgent(t.dataset.stop));
     if (t.dataset.rd) {
       var parts = t.dataset.rd.split(":");
       openRow = null;
-      return dispatch(parts[0], parts[1], "");
+      return actWrap("g" + parts[0] + parts[1], dispatch(parts[0], parts[1], ""));
     }
     if (t.dataset.row) { openRow = openRow === t.dataset.row ? null : t.dataset.row; return render(); }
     if (t.dataset.open) {
@@ -748,8 +783,8 @@
     }
     if (e.target.id === "dgo") {
       var num = $("dnum"), txt = $("dtxt");
-      dispatch(dockVerb, num ? num.value.trim() : "", txt ? txt.value.trim() : "")
-        .then(function (ok) { if (ok) { if (num) num.value = ""; if (txt) txt.value = ""; } });
+      actWrap("dock", dispatch(dockVerb, num ? num.value.trim() : "", txt ? txt.value.trim() : "")
+        .then(function (ok) { if (ok) { if (num) num.value = ""; if (txt) txt.value = ""; } }));
     }
   });
 
