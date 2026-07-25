@@ -134,6 +134,18 @@
   .tone.good { background: var(--calm); }
   .tk { font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
   .pr { font-size: 12px; color: var(--dim); }
+  /* Gate strip: the three things that gate auto-progression (CI, greptile
+     score, conflicts) plus human review, per row. The verdict says what to
+     do; these say which gate said so. */
+  .gates { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 0 18px; }
+  .g {
+    font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums;
+    padding: 1px 7px; border-radius: 4px;
+    border: 1px solid var(--rule); color: var(--faint);
+  }
+  .g.good { color: var(--calm); border-color: color-mix(in srgb, var(--calm) 45%, var(--rule)); }
+  .g.bad { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, var(--rule)); }
+  .g.amber { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--rule)); }
   .why { margin-left: auto; font-size: 12px; color: var(--dim); font-family: var(--mono);
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 48%; text-align: right; }
   .why.bad, .why.blocked { color: var(--alert); }
@@ -465,6 +477,23 @@
     return h + '<div style="height:16px"></div>';
   }
 
+  function gateStrip(r) {
+    if (!r.pr) return "";
+    var b = [];
+    if (r.conflicts) b.push(["bad", "conflicts"]);
+    b.push(r.failed ? ["bad", "ci ✗ " + r.failed]
+         : r.pending ? ["amber", "ci … " + r.pending]
+         : r.checks ? ["good", "ci ✓"] : ["", "ci —"]);
+    b.push(r.greptile == null ? ["", "G —"]
+         : [r.greptile === 5 ? "good" : "bad", "G " + r.greptile + "/5"]);
+    b.push(r.review === "APPROVED" ? ["good", "appr ✓"]
+         : r.review === "CHANGES_REQUESTED" ? ["bad", "changes ✗"]
+         : ["", "rev —"]);
+    return '<div class="gates">' + b.map(function (x) {
+      return '<span class="g ' + x[0] + '">' + x[1] + "</span>";
+    }).join("") + "</div>";
+  }
+
   function vBoard() {
     if (!brd.gh) {
       return '<div class="empty">gh unavailable \u2014 the board needs it to read PR state. ' +
@@ -482,6 +511,7 @@
                (r.pr && r.ticket ? '<span class="pr mono">#' + r.pr + "</span>" : "") +
                '<span class="why ' + r.tone + '">' + esc(r.why) + "</span>" +
              "</div>" +
+             gateStrip(r) +
              (r.title ? '<div class="btitle">' + esc(r.title) + "</div>" : "") +
            "</div>";
       if (open) {
