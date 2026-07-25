@@ -19,6 +19,7 @@ not cd anywhere first; spawn reads `~/.config/clanker/env`.
 | cslr / review | `spawn review <ticket-or-pr>` | resolves ticket → PR URL itself |
 | csln / new session | `spawn new [prompt...]` | trailing text is the opening prompt |
 | plan / style / cleanup / status | `spawn <verb> <ticket>` | same shape |
+| resume / wake — "resume the fleet", "wake them all", "session limit reset" | `spawn resume all` | fork-resumes every idle work session where it left off, context intact. `spawn resume <ticket>` targets one (ended sessions too). Busy/blocked agents are skipped, never disturbed. |
 
 - Ticket ids: 1–6 digits; `SLATE-`/`#` prefixes are fine, spawn strips them.
 - Extra context after the id is passed through: `spawn implement 5506 stack on the parent PR`.

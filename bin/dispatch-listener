@@ -173,11 +173,12 @@ while true; do
     # Non-dispatch traffic is ignored, but say so in the journal — otherwise a
     # typo'd verb looks exactly like a dead listener from the phone's side.
     # Verb list mirrors bin/spawn; `status` is the one verb that takes no id.
-    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|new|session|stop)$ ]]; then
+    if ! [[ "${cmd:-}" =~ ^(implement|ship|plan|style|cleanup|review|continue|revise|status|resume|wake|new|session|stop)$ ]]; then
       echo "ignored (not a dispatch): $msg"
       continue
     fi
-    if ! [[ "$cmd" =~ ^(status|new|session|stop)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
+    # resume takes `all`, a ticket, or nothing — spawn validates it itself.
+    if ! [[ "$cmd" =~ ^(status|resume|wake|new|session|stop)$ ]] && ! [[ "${ticket:-}" =~ ^(SLATE-|slate-|#)?[0-9]{1,6}$ ]]; then
       echo "ignored (bad id): $msg"
       continue
     fi

@@ -117,6 +117,7 @@ never have to recall which vocabulary this wants:
 | `review` | `/sl-review` | **PR number** | `review-3771` |
 | `continue` / `revise` | `/sl-revise` | **PR number** | `revise-3771` |
 | `status` | `/sl-status` | none | `status` |
+| `resume` / `wake` | *(fork-resumes previous sessions)* | `all` or ticket | existing labels |
 | `new` / `session` | *(none — bare session)* | none | `new`, `new-2`, … |
 
 - `id`: 1–6 digits. `SLATE-`, `slate-` and `#` prefixes are stripped.

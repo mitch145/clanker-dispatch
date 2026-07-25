@@ -46,6 +46,10 @@ verbs whose slash command wants a PR, the ticket is resolved to its PR first.
   review         5506   -> /sl-review <url of the PR for SLATE-5506>
   continue|revise 5506  -> /sl-revise <PR for SLATE-5506>
   status                -> /sl-status                (no id)
+  resume|wake [all|5580] [context...]
+                        -> fork-resume idle work sessions where they left
+                           off (after a session-limit reset). `all` wakes
+                           every idle one; a ticket also raises ended ones.
   new|session [text...]  -> bare claude session in the repo
 
 A number with no PR referencing it is passed through as a literal PR number.
@@ -71,6 +75,10 @@ case "$verb" in
   review)          act=review;  slash="/sl-review";  idstyle=prurl  ;;  # full URL
   continue|revise) act=revise;  slash="/sl-revise";  idstyle=pr     ;;
   status)          act=status;  slash="/sl-status";  idstyle=none   ;;
+  # Wake previous work sessions after a session-limit reset (or any stall):
+  # `resume all` fork-resumes every idle work session with a nudge to pick up
+  # where it left off; `resume 5580` targets one ticket, ended sessions too.
+  resume|wake)     act=resume;  slash="";            idstyle=fleet  ;;
   # Bare session in the repo, no slash command. Any trailing text becomes the
   # opening prompt: `new look at the flaky auth test`.
   new|session)     act=new;     slash="";            idstyle=none   ;;
@@ -124,7 +132,14 @@ resolve_pr() {
   fi
 }
 
-if [[ "$idstyle" == none ]]; then
+if [[ "$idstyle" == fleet ]]; then
+  id=""; label="$act"
+  target="${1:-all}"
+  [[ $# -ge 1 ]] && shift
+  target="${target#SLATE-}"; target="${target#slate-}"; target="${target#\#}"
+  [[ "$target" =~ ^(all|[0-9]{1,6})$ ]] \
+    || { echo "spawn: resume takes 'all' or a ticket number, got '$target'" >&2; exit 64; }
+elif [[ "$idstyle" == none ]]; then
   id=""; label="$act"
 else
   [[ $# -ge 1 ]] || usage
@@ -197,6 +212,56 @@ resume_pick() { # resume_pick <ticket> -> "sessionId<TAB>shortId<TAB>live|ended"
 agent_alive() {
   agents_json | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1
 }
+
+# Fleet resume: wake previous work sessions where they left off. The one
+# scenario this exists for: the session limit exhausts mid-afternoon, every
+# agent's turn gets cut short and sits idle, the limit resets, and you want
+# one command — from a phone — that puts the whole fleet back to work with
+# their context intact. Fork-resume, same rules as revise: idle background
+# sessions get stopped first so the fork is the only writer; busy/waiting
+# ones are genuinely working and are left alone. `resume all` wakes idle
+# sessions only; `resume <ticket>` also raises ended (done/stopped) ones.
+if [[ "$act" == resume ]]; then
+  extra="$*"
+  msg="Your earlier turn was cut short (session limit or a stop); it is now safe to continue. Review where you left off: if the task is incomplete, resume exactly there and drive it to completion. If it was already complete, re-confirm the exit gates and finish."
+  [[ -n "$extra" ]] && msg="$msg — $extra"
+  cd "$REPO"
+  count=0
+  while IFS=$'\t' read -r r_name r_sid r_short r_st; do
+    [[ -n "$r_name" && -n "$r_sid" ]] || continue
+    if [[ "$r_st" == busy || "$r_st" == waiting ]]; then
+      echo "skip [$r_name] ($r_st — still working)"
+      continue
+    fi
+    if [[ "$target" == all && "$r_st" != idle ]]; then
+      continue  # ended long ago; waking those needs an explicit ticket
+    fi
+    [[ "$r_st" == idle && -n "$r_short" ]] \
+      && { timeout 25 "$claude_bin" stop "$r_short" >/dev/null 2>&1 || true; }
+    if "$claude_bin" --resume "$r_sid" --fork-session \
+         -n "$r_name" --remote-control="$r_name" --bg \
+         ${PERM_MODE:+--permission-mode "$PERM_MODE"} \
+         "$msg" >/dev/null 2>&1 </dev/null; then
+      echo "resumed [$r_name]"
+      count=$((count + 1))
+    else
+      echo "resume FAILED [$r_name]" >&2
+    fi
+  done < <(agents_all_json | jq -r --arg t "$target" '
+      [.[] | select(type == "object")
+           | select((.name // "") | test("^(ship|revise|plan|style|cleanup)-[0-9]+(-[0-9]+)?$"))
+           | select(if $t == "all" then true
+                    else ((.name // "") | test("^[a-z]+-" + $t + "(-[0-9]+)?$")) end)]
+      | group_by(.name) | map(max_by(.startedAt // 0))
+      | .[] | [.name, .sessionId // "", .id // "",
+               (if has("status") then .status else (.state // "done") end)] | @tsv')
+  if (( count == 0 )); then
+    echo "nothing to resume for '$target'" >&2
+    exit "$EX_SKIP"
+  fi
+  echo "resumed $count session(s)"
+  exit 0
+fi
 
 # Idempotency guard: one window per id. ntfy delivers at least once, and the
 # listener replays `since=10m` on restart, so a redelivered message must not
