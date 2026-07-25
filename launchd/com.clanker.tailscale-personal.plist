@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.clanker.tailscale-personal</string>
+  <!-- Sidecar tailscaled on the PERSONAL tailnet, beside the work GUI app.
+       userspace-networking: no TUN device, no routes, no DNS — inbound
+       tailnet connections are proxied to the same port on 127.0.0.1, which
+       is exactly what the clanker-ui panel on :8787 needs. The work app
+       never sees this process. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/tailscale/bin/tailscaled</string>
+    <string>--tun=userspace-networking</string>
+    <string>--statedir=/Users/mitch/.local/state/tailscale-personal</string>
+    <string>--socket=/Users/mitch/.local/state/tailscale-personal/tailscaled.sock</string>
+    <string>--port=0</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/mitch/Library/Logs/clanker/tailscaled-personal.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mitch/Library/Logs/clanker/tailscaled-personal.log</string>
+</dict>
+</plist>
