@@ -270,6 +270,7 @@ def pr_gates():
         return {}
     q = ("query($q: String!) { search(query: $q, type: ISSUE, first: 40) {"
          " nodes { ... on PullRequest { number mergeable"
+         " reviewThreads(first: 100) { nodes { isResolved } }"
          " comments(last: 50) { nodes { author { login } body } } } } } }")
     try:
         out = subprocess.run(
@@ -294,11 +295,15 @@ def pr_gates():
             m = GREPTILE_RE.search(c.get("body") or "")
             if m:
                 score = int(m.group(1))
+        threads = ((n.get("reviewThreads") or {}).get("nodes")) or []
         gates[num] = {
             "greptile": score,
             # UNKNOWN (GitHub still computing) is deliberately not a conflict:
             # flagging it would cry wolf on every fresh push.
             "conflicts": n.get("mergeable") == "CONFLICTING",
+            # Unresolved review threads: this is the state Graphite reads for
+            # its "Unresolved comments" merge blocker, straight from GitHub.
+            "unresolved": sum(1 for t in threads if not t.get("isResolved")),
         }
     return gates
 
@@ -337,6 +342,12 @@ def next_action(pr, agent_phase):
     g = pr.get("_greptile")
     if g is not None and g < 5:
         return "continue", "greptile %d/5" % g, "bad"
+    # Unresolved review threads block Graphite's queue and are the daily
+    # tedium: comments land, and each PR needs a revise dispatched at it.
+    # This turns that loop into one chip per row.
+    u = int(pr.get("_unresolved") or 0)
+    if u:
+        return "continue", "%d unresolved comment%s" % (u, "" if u == 1 else "s"), "bad"
     rd = (pr.get("reviewDecision") or "").upper()
     if rd == "CHANGES_REQUESTED":
         return "continue", "changes requested", "bad"
@@ -396,6 +407,7 @@ def board(force=False):
                 g = gates.get(pr.get("number")) or {}
                 pr["_greptile"] = g.get("greptile")
                 pr["_conflicts"] = bool(g.get("conflicts"))
+                pr["_unresolved"] = int(g.get("unresolved") or 0)
         with _board_lock:
             _board["at"] = now
             _board["data"] = prs
@@ -465,6 +477,7 @@ def board(force=False):
             "review": pr.get("reviewDecision") or "",
             "failed": failed, "pending": pending, "checks": total,
             "greptile": pr.get("_greptile"), "conflicts": pr.get("_conflicts", False),
+            "unresolved": int(pr.get("_unresolved") or 0),
             "parent": pr.get("_parent"),
             "ready": why == "approved · ready to merge",
             "sessions": sessions_for(ticket, pr.get("number")),
@@ -481,7 +494,8 @@ def board(force=False):
         rows.append({
             "ticket": ticket, "pr": None, "url": None, "title": "",
             "draft": False, "review": "", "failed": 0, "pending": 0, "checks": 0,
-            "greptile": None, "conflicts": False, "parent": None, "ready": False,
+            "greptile": None, "conflicts": False, "unresolved": 0,
+            "parent": None, "ready": False,
             "sessions": sessions_for(ticket),
             "phase": ph, "next": verb, "why": why, "tone": tone, "updatedAt": "",
         })

@@ -506,6 +506,7 @@
          : r.checks ? ["good", "ci ✓"] : ["", "ci —"]);
     b.push(r.greptile == null ? ["", "G —"]
          : [r.greptile === 5 ? "good" : "bad", "G " + r.greptile + "/5"]);
+    if (r.unresolved) b.push(["bad", "cmt " + r.unresolved]);
     b.push(r.review === "APPROVED" ? ["good", "appr ✓"]
          : r.review === "CHANGES_REQUESTED" ? ["bad", "changes ✗"]
          : ["", "rev —"]);
@@ -534,6 +535,14 @@
     }
     if (!brd.rows.length) return '<div class="empty">nothing open. Dispatch something below.</div>';
     var h = "";
+    // The comment-morning ritual — clank comments land on half the stack and
+    // every PR needs a cslc — collapses to one button when 2+ rows want one.
+    var wanting = brd.rows.filter(function (r) { return r.next === "continue" && r.ticket; });
+    if (wanting.length >= 2) {
+      h += '<div class="bacts" style="margin-top:10px"><button class="btn primary" data-goall="' +
+           wanting.map(function (r) { return r.ticket; }).join(",") +
+           '">cslc all ' + wanting.length + " flagged</button></div>";
+    }
     brd.rows.forEach(function (r) {
       var t = r.ticket || String(r.pr);
       var open = openTicket === t;
@@ -674,11 +683,20 @@
   });
 
   main.addEventListener("click", function (e) {
-    var t = e.target.closest("[data-stop],[data-rd],[data-row],[data-open],[data-cmd],[data-go],[data-tk],[data-merge],#hero");
+    var t = e.target.closest("[data-stop],[data-rd],[data-row],[data-open],[data-cmd],[data-go],[data-tk],[data-merge],[data-goall],#hero");
     if (!t) return;
     if (t.dataset.merge) {
       if (!confirm("Queue #" + t.dataset.merge + " into the Graphite merge queue?")) return;
       return mergePR(t.dataset.merge);
+    }
+    if (t.dataset.goall) {
+      var ts = t.dataset.goall.split(",");
+      if (!confirm("Dispatch cslc against " + ts.length + " tickets: " + ts.join(", ") + "?")) return;
+      // Sequential, not parallel: each spawn shells out to `claude` and gh,
+      // and a burst of six at once serialises badly anyway.
+      return ts.reduce(function (p, tk) {
+        return p.then(function () { return dispatch("continue", tk, ""); });
+      }, Promise.resolve()).then(function () { refreshBoard(true); });
     }
     if (t.dataset.go) {
       var g = t.dataset.go.split(":");
