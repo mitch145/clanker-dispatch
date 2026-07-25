@@ -521,7 +521,11 @@
           h += '<button class="btn' + (pick ? " primary" : "") + '" data-go="' + v + ":" + esc(r.ticket || "") +
                '"' + (r.ticket ? "" : " disabled") + ">" + SHORT[v] + " " + esc(r.ticket || "") + "</button>";
         });
-        if (r.url) h += '<a class="btn" href="' + esc(r.url) + '" target="_blank" rel="noopener">PR</a>';
+        if (r.url) h += '<a class="btn" href="' + esc(r.url) + '" target="_blank" rel="noopener">GitHub</a>';
+        if (r.pr && brd.repo) {
+          h += '<a class="btn" href="https://app.graphite.dev/github/pr/' + esc(brd.repo) + "/" + r.pr +
+               '" target="_blank" rel="noopener">Graphite</a>';
+        }
         h += "</div>";
       } else if (r.next && r.ticket) {
         h += '<div class="bacts"><button class="btn primary" data-go="' + r.next + ":" + esc(r.ticket) +

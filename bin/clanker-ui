@@ -443,7 +443,9 @@ def board(force=False):
 
     tone_rank = {"blocked": 0, "bad": 1, "todo": 2, "flight": 3, "good": 4}
     rows.sort(key=lambda r: (tone_rank.get(r["tone"], 9), -(int(r["ticket"] or 0))))
-    return {"rows": rows, "gh": cached is not None}
+    # repo rides along so the page can build Graphite deep links: Graphite's
+    # PR URL is derived from owner/repo/number, not stored anywhere on GitHub.
+    return {"rows": rows, "gh": cached is not None, "repo": GH_REPO}
 
 
 def run(cmd, timeout=30):
