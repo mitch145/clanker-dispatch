@@ -15,6 +15,7 @@ Config (from ~/.config/clanker/env, same file as everything else):
   CLANKER_UI_PORT    default 8787
   CLANKER_UI_BIND    default 0.0.0.0
 """
+import datetime
 import hmac
 import json
 import os
@@ -238,7 +239,7 @@ TRUNK = os.environ.get("CLANKER_TRUNK", "main")
 TICKET_RE = re.compile(r"SLATE-(\d{1,6})", re.I)
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "clanker"
 
-_board = {"at": 0.0, "data": None}
+_board = {"at": 0.0, "data": None, "merged": {}}
 _board_lock = threading.Lock()
 BOARD_TTL = 60.0  # a gh round trip is seconds, and PR state does not move fast
 
@@ -401,6 +402,40 @@ def next_action(pr, agent_phase):
     return None, "5/5 · waiting on reviewers", "flight"
 
 
+def gh_merged():
+    """{ticket: merged-at epoch} for recently merged PRs. The dispatch-history
+    fallback needs this: a merged PR leaves the open list, and without it the
+    history resurrects the ticket as a 'no PR yet' row inviting a re-implement
+    of shipped code."""
+    gh = shutil.which("gh")
+    if not gh:
+        return {}
+    try:
+        out = subprocess.run(
+            [gh, "pr", "list", "--repo", GH_REPO, "--author", "@me",
+             "--state", "merged", "--limit", "30",
+             "--json", "title,headRefName,mergedAt"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+        prs = json.loads(out) if out.strip() else []
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return {}
+    merged = {}
+    for p in prs:
+        try:
+            ts = datetime.datetime.strptime(
+                p.get("mergedAt") or "", "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            continue
+        for src in (p.get("title") or "", p.get("headRefName") or ""):
+            m = TICKET_RE.search(src)
+            if m:
+                t = m.group(1)
+                merged[t] = max(merged.get(t, 0), ts)
+    return merged
+
+
 def recent_dispatches(limit=40):
     """Tickets dispatched lately, so one with no PR yet is still on the board."""
     f = STATE_DIR / "dispatched.jsonl"
@@ -436,9 +471,11 @@ def board(force=False):
                 pr["_conflicts"] = bool(g.get("conflicts"))
                 pr["_unresolved"] = int(g.get("unresolved") or 0)
                 pr["_queued"] = bool(g.get("queued"))
+        merged = gh_merged() if prs is not None else {}
         with _board_lock:
             _board["at"] = now
             _board["data"] = prs
+            _board["merged"] = merged
         cached = prs
 
     # Stack position: a PR whose base is another PR's head is stacked on it.
@@ -518,8 +555,19 @@ def board(force=False):
             "updatedAt": pr.get("updatedAt") or "",
         })
 
+    with _board_lock:
+        merged_at = dict(_board.get("merged") or {})
+    now_s = time.time()
     for ticket, at in recent_dispatches().items():
         if ticket in seen:
+            continue
+        # Ghost filters. The dispatch history exists so a just-started ticket
+        # shows before its PR does — not to resurrect finished work: a ticket
+        # whose PR merged AFTER it was dispatched is done, and a dispatch
+        # older than a day isn't "just started" by any reading.
+        if merged_at.get(ticket, 0) > at:
+            continue
+        if now_s - at > 86400:
             continue
         seen.add(ticket)
         ph = phase_by_ticket.get(ticket)
