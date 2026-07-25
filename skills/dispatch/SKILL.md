@@ -1,9 +1,9 @@
 ---
-name: clank
+name: dispatch
 description: Dispatch a clanker background agent for a ticket/PR — csli, cslc, cslr, csln, "spin out an implementer", "dispatch an agent at 5506". Runs bin/spawn on this box; the session self-registers in the Claude app and the clanker panel. ONLY when the user explicitly asks for an agent to be spun out — never proactively, never as a side effect of other work.
 ---
 
-# clank — dispatch a background agent
+# dispatch — spin out a background agent
 
 Run `~/.local/bin/spawn <verb> [id] [extra context...]` via Bash. That is the
 whole mechanism — spawn handles config, PR resolution, naming, idempotency,

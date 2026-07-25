@@ -268,13 +268,18 @@ fi
 # time the listener restarts — `make restart` would silently take out every
 # running agent. A transient scope makes them independent of us.
 cd "$REPO"
+# </dev/null on every branch: when the listener calls spawn, stdin is the
+# ntfy curl stream — left attached, `claude --bg` blocks on it instead of
+# detaching (and can eat queued dispatches off the stream). systemd-run
+# detached stdin implicitly on Linux, which is why only the fallback branch
+# — the one macOS always takes — ever hung.
 if command -v systemd-run >/dev/null && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
   systemd-run --user --scope --quiet --collect \
     --unit="clanker-agent-$label-$$" \
-    "$claude_bin" "${args[@]}" >/dev/null 2>&1 \
-    || "$claude_bin" "${args[@]}" >/dev/null 2>&1
+    "$claude_bin" "${args[@]}" >/dev/null 2>&1 </dev/null \
+    || "$claude_bin" "${args[@]}" >/dev/null 2>&1 </dev/null
 else
-  "$claude_bin" "${args[@]}" >/dev/null 2>&1
+  "$claude_bin" "${args[@]}" >/dev/null 2>&1 </dev/null
 fi
 
 # Record what was dispatched. The board is built from open PRs, but a ticket
