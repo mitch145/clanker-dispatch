@@ -123,6 +123,10 @@ never have to recall which vocabulary this wants:
   `review` expands a bare number into a full GitHub PR URL, because
   `/sl-review` takes a URL and not a ticket — the two id spaces are
   different and don't share validation.
+- `continue`/`revise` resumes the ticket's most recent finished `ship-`/
+  `revise-` session on this box when one exists (forked, so the original
+  transcript stays intact) — the reviser starts with the implementer's
+  context instead of cold. No prior session → fresh session, as before.
 - Trailing text is appended after ` — `. For `new` it *is* the prompt.
 - Session name is `<action>-<number>`, keyed on the action as well as the id:
   reviewing a PR and then revising it is an ordinary sequence and must not

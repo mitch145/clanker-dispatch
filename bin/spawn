@@ -164,6 +164,20 @@ fi
   || { echo "spawn: claude not found (set CLAUDE_BIN in $ENV_FILE)" >&2; exit 127; }
 
 agents_json() { timeout 20 "$claude_bin" agents --json 2>/dev/null; }
+agents_all_json() { timeout 20 "$claude_bin" agents --json --all 2>/dev/null; }
+
+# A revise lands best in the head of whoever last worked the ticket: the
+# implementer's session already holds the design decisions, the review thread,
+# and the reasons things are the way they are. Resume that session — forked,
+# so the original transcript stays intact and the revise gets its own id under
+# its own label — instead of starting cold. Only finished sessions are
+# candidates: resuming a live one would race the agent still driving it.
+prior_session() { # prior_session <ticket> -> session id or empty
+  agents_all_json | jq -r --arg t "$1" '
+      [.[] | select((.state == "done" or .state == "stopped")
+                    and ((.name // "") | test("^(ship|revise)-" + $t + "(-[0-9]+)?$")))]
+      | (max_by(.startedAt // 0) | .sessionId) // empty' 2>/dev/null
+}
 
 # Is a session with this name alive right now? `claude agents --json` is the
 # source of truth — it knows about background agents, which have no tmux window
@@ -204,6 +218,11 @@ fi
 # -d so an attached client doesn't lose focus; `exec $SHELL` so the window
 # survives claude exiting and the scrollback is there for a post-mortem.
 args=(-n "$label" --remote-control="$label" --bg)
+resume_sid=""
+if [[ "$act" == revise && -n "${raw:-}" ]]; then
+  resume_sid="$(prior_session "$raw")"
+  [[ -n "$resume_sid" ]] && args=(--resume "$resume_sid" --fork-session "${args[@]}")
+fi
 [[ -n "$PERM_MODE" ]] && args+=(--permission-mode "$PERM_MODE")
 # Omit the prompt arg entirely when empty — an empty string is still an
 # argument, and `claude ''` is not the same as `claude`.
@@ -239,9 +258,12 @@ fi
 
 # Say what the ticket resolved to. The label is the ticket you typed, so
 # without this line there's nothing anywhere that records which PR the session
-# was actually pointed at.
+# was actually pointed at. Same for a resume: which head this landed in is
+# recorded nowhere else.
+mode="spawned"
+[[ -n "${resume_sid:-}" ]] && mode="resumed ${resume_sid:0:8} as"
 if [[ "$idstyle" =~ ^(pr|prurl)$ && "${id##*/}" != "$raw" ]]; then
-  echo "spawned [$label] SLATE-$raw -> PR ${id##*/}"
+  echo "$mode [$label] SLATE-$raw -> PR ${id##*/}"
 else
-  echo "spawned [$label] ${prompt:-(bare session)}"
+  echo "$mode [$label] ${prompt:-(bare session)}"
 fi
